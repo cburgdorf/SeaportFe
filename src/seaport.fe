@@ -3,17 +3,15 @@
 // ReentrancyGuard constructor). `Seaport` and `Consideration` differ only in
 // their name, which also enters the EIP-712 domain separator.
 use std::abi::{Bytes32, DynArray, DynString, sol}
-use std::evm::{Address, Call, Create, Ctx, Log, RawOps, revert_error}
+use std::evm::{Address, Call, Create, Ctx, Log, RawOps, TSlot}
 use super::basic::{assert_decodable_basic_order_calldata, validate_and_fulfill_basic_order}
 use super::combiner::{fulfill_available_advanced_orders, match_advanced_orders}
-use super::errors::TloadTestContractDeploymentFailed
 use super::fulfill::validate_and_fulfill_advanced_order
-use super::hashing::{Env, derive_domain_separator, derive_order_hash}
+use super::hashing::{Env, derive_components_hash, derive_domain_separator}
 use super::manage::{cancel, validate}
 use super::model::{
     advanced_orders,
     no_resolvers,
-    components_book,
     fulfillments,
     nested_components,
     orders_as_advanced,
@@ -21,19 +19,17 @@ use super::model::{
     single_advanced,
     single_order,
 }
-use super::arr::Arr
 use super::signature::domain_separator
 use super::status::{
-    NOT_ENTERED_SSTORE,
+    OrderStore,
     REENTRANCY_GUARD_SLOT,
     activate_tstore,
     assert_accepting_native_tokens,
     get_contract_nonce,
     get_counter,
     increment_counter,
-    prepare_tload_test,
     read_status,
-    test_tload,
+    setup_reentrancy_guard,
 }
 use super::types::{
     AdvancedOrder,
@@ -140,18 +136,11 @@ msg ConduitControllerQuery {
 
 /// Constructor of ConsiderationBase and ReentrancyGuard.
 pub fn setup(name_hash: u256, conduit_controller: Address) -> Env
-uses (ctx: Ctx, call: mut Call, create: mut Create, ops: mut RawOps)
+uses (guard_state: mut u256, ctx: Ctx, call: mut Call, create: mut Create)
 {
     let (creation_code_hash, _runtime_code_hash) = conduit_controller
         .static(ConduitControllerQuery::GetConduitCodeHashes {})
-    let tload_test_contract = prepare_tload_test()
-    if tload_test_contract.inner == 0 {
-        revert_error(TloadTestContractDeploymentFailed {})
-    }
-    let tstore_initial_support = test_tload(tload_test_contract)
-    if !tstore_initial_support {
-        ops.sstore(slot: REENTRANCY_GUARD_SLOT, value: NOT_ENTERED_SSTORE)
-    }
+    let (tstore_initial_support, tload_test_contract) = setup_reentrancy_guard()
     Env {
         name_hash,
         chain_id: ctx.chainid(),
@@ -168,7 +157,7 @@ uses (ctx: Ctx, call: mut Call, create: mut Create, ops: mut RawOps)
 }
 
 fn caller_if_zero(_ recipient: Address) -> Address uses (ctx: Ctx) {
-    if recipient.inner == 0 {
+    if recipient.word() == 0 {
         ctx.caller()
     } else {
         recipient
@@ -176,18 +165,35 @@ fn caller_if_zero(_ recipient: Address) -> Address uses (ctx: Ctx) {
 }
 
 pub fn fulfill_basic_order(_ env: Env) -> bool
-uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+uses (
+    store: mut OrderStore,
+    guard_state: mut u256,
+    transient_guard: mut TSlot<u256>,
+    ctx: Ctx,
+    call: mut Call,
+    ops: mut RawOps,
+    log: mut Log,
+)
 {
     assert_decodable_basic_order_calldata()
     validate_and_fulfill_basic_order(env)
 }
 
 pub fn fulfill_order(_ env: Env, order: Order, fulfiller_conduit_key: Bytes32) -> bool
-uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+uses (
+    store: mut OrderStore,
+    guard_state: mut u256,
+    transient_guard: mut TSlot<u256>,
+    ctx: Ctx,
+    call: mut Call,
+    ops: mut RawOps,
+    log: mut Log,
+)
 {
+    var book = single_order(order)
     validate_and_fulfill_advanced_order(
         env,
-        book: single_order(order),
+        mut book,
         resolvers: no_resolvers(),
         fulfiller_conduit_key: fulfiller_conduit_key.val,
         recipient: ctx.caller(),
@@ -201,11 +207,20 @@ pub fn fulfill_advanced_order(
     fulfiller_conduit_key: Bytes32,
     recipient: Address,
 ) -> bool
-uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+uses (
+    store: mut OrderStore,
+    guard_state: mut u256,
+    transient_guard: mut TSlot<u256>,
+    ctx: Ctx,
+    call: mut Call,
+    ops: mut RawOps,
+    log: mut Log,
+)
 {
+    var book = single_advanced(advanced_order)
     validate_and_fulfill_advanced_order(
         env,
-        book: single_advanced(advanced_order),
+        mut book,
         resolvers: resolvers(criteria_resolvers),
         fulfiller_conduit_key: fulfiller_conduit_key.val,
         recipient: caller_if_zero(recipient),
@@ -220,11 +235,20 @@ pub fn fulfill_available_orders(
     fulfiller_conduit_key: Bytes32,
     maximum_fulfilled: u256,
 ) -> (DynArray<bool>, DynArray<Execution>)
-uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+uses (
+    store: mut OrderStore,
+    guard_state: mut u256,
+    transient_guard: mut TSlot<u256>,
+    ctx: Ctx,
+    call: mut Call,
+    ops: mut RawOps,
+    log: mut Log,
+)
 {
+    var book = orders_as_advanced(orders)
     fulfill_available_advanced_orders(
         env,
-        book: orders_as_advanced(orders),
+        mut book,
         resolvers: no_resolvers(),
         offer_fulfillments: nested_components(offer_fulfillments),
         consideration_fulfillments: nested_components(consideration_fulfillments),
@@ -244,11 +268,20 @@ pub fn fulfill_available_advanced(
     recipient: Address,
     maximum_fulfilled: u256,
 ) -> (DynArray<bool>, DynArray<Execution>)
-uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+uses (
+    store: mut OrderStore,
+    guard_state: mut u256,
+    transient_guard: mut TSlot<u256>,
+    ctx: Ctx,
+    call: mut Call,
+    ops: mut RawOps,
+    log: mut Log,
+)
 {
+    var book = advanced_orders(orders)
     fulfill_available_advanced_orders(
         env,
-        book: advanced_orders(orders),
+        mut book,
         resolvers: resolvers(criteria_resolvers),
         offer_fulfillments: nested_components(offer_fulfillments),
         consideration_fulfillments: nested_components(consideration_fulfillments),
@@ -263,11 +296,20 @@ pub fn match_orders(
     orders: DynArray<Order>,
     fulfillments_in: DynArray<Fulfillment>,
 ) -> DynArray<Execution>
-uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+uses (
+    store: mut OrderStore,
+    guard_state: mut u256,
+    transient_guard: mut TSlot<u256>,
+    ctx: Ctx,
+    call: mut Call,
+    ops: mut RawOps,
+    log: mut Log,
+)
 {
+    var book = orders_as_advanced(orders)
     match_advanced_orders(
         env,
-        book: orders_as_advanced(orders),
+        mut book,
         resolvers: no_resolvers(),
         fulfillments: fulfillments(fulfillments_in),
         recipient: ctx.caller(),
@@ -281,40 +323,46 @@ pub fn match_advanced(
     fulfillments_in: DynArray<Fulfillment>,
     recipient: Address,
 ) -> DynArray<Execution>
-uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+uses (
+    store: mut OrderStore,
+    guard_state: mut u256,
+    transient_guard: mut TSlot<u256>,
+    ctx: Ctx,
+    call: mut Call,
+    ops: mut RawOps,
+    log: mut Log,
+)
 {
+    var book = advanced_orders(orders)
     match_advanced_orders(
         env,
-        book: advanced_orders(orders),
+        mut book,
         resolvers: resolvers(criteria_resolvers),
         fulfillments: fulfillments(fulfillments_in),
         recipient: caller_if_zero(recipient),
     )
 }
 
-pub fn get_order_hash(_ order: OrderComponents) -> Bytes32 uses (ops: RawOps) {
-    let (book, counter) = components_book(order)
-    Bytes32 { val: derive_order_hash(book, order: book.order(0), counter) }
+pub fn get_order_hash(_ order: OrderComponents) -> Bytes32 {
+    Bytes32 { val: derive_components_hash(order) }
 }
 
 pub fn get_order_status(_ order_hash: Bytes32) -> (bool, bool, u256, u256)
-uses (ops: RawOps)
+uses (store: OrderStore)
 {
     let status = read_status(order_hash.val)
     (status.is_validated, status.is_cancelled, status.numerator, status.denominator)
 }
 
 pub fn information(_ env: Env) -> (DynString, Bytes32, Address) uses (ctx: Ctx) {
-    (
-        DynString::from_word_prefix(word: 0x312e36 << 232, len: 3),
-        Bytes32 { val: domain_separator(env) },
-        env.conduit_controller,
-    )
+    ("1.6", Bytes32 { val: domain_separator(env) }, env.conduit_controller)
 }
 
 /// Plain ETH transfers are only accepted while an order that allows them is
 /// being fulfilled (`receive()`); other unknown calls revert.
-pub fn receive(_ env: Env) uses (ctx: Ctx, ops: RawOps) {
+pub fn receive(_ env: Env)
+uses (guard_state: u256, transient_guard: TSlot<u256>, ctx: Ctx, ops: RawOps)
+{
     if ops.calldatasize() != 0 {
         std::evm::revert(())
     }
@@ -323,9 +371,15 @@ pub fn receive(_ env: Env) uses (ctx: Ctx, ops: RawOps) {
 
 pub contract Seaport {
     env: Env,
+    #[slot(0)]
+    mut store: OrderStore,
+    #[slot(REENTRANCY_GUARD_SLOT)]
+    mut guard_state: u256,
+    #[slot(REENTRANCY_GUARD_SLOT)]
+    mut transient_guard: TSlot<u256>,
 
     init(conduitController: Address)
-    uses (mut env, ctx: Ctx, call: mut Call, create: mut Create, ops: mut RawOps)
+    uses (mut guard_state, mut env, ctx: Ctx, call: mut Call, create: mut Create)
     {
         env = setup(
             name_hash: SEAPORT_NAME_HASH,
@@ -336,6 +390,9 @@ pub contract Seaport {
     recv {
         #[payable]
         SeaportMsg::FulfillBasicOrder {} -> bool uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
             env,
             ctx: Ctx,
             call: mut Call,
@@ -346,13 +403,31 @@ pub contract Seaport {
         }
         #[payable]
         SeaportMsg::FulfillBasicOrderEfficient {} -> bool
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             fulfill_basic_order(env)
         }
         #[payable]
         SeaportMsg::FulfillOrder { order, fulfillerConduitKey } -> bool
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             fulfill_order(env, order, fulfiller_conduit_key: fulfillerConduitKey)
         }
@@ -363,7 +438,16 @@ pub contract Seaport {
             fulfillerConduitKey,
             recipient,
         } -> bool
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             fulfill_advanced_order(
                 env,
@@ -381,7 +465,16 @@ pub contract Seaport {
             fulfillerConduitKey,
             maximumFulfilled,
         } -> (DynArray<bool>, DynArray<Execution>)
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             fulfill_available_orders(
                 env,
@@ -402,7 +495,16 @@ pub contract Seaport {
             recipient,
             maximumFulfilled,
         } -> (DynArray<bool>, DynArray<Execution>)
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             fulfill_available_advanced(
                 env,
@@ -417,7 +519,16 @@ pub contract Seaport {
         }
         #[payable]
         SeaportMsg::MatchOrders { orders, fulfillments } -> DynArray<Execution>
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             match_orders(env, orders, fulfillments_in: fulfillments)
         }
@@ -428,7 +539,16 @@ pub contract Seaport {
             fulfillments,
             recipient,
         } -> DynArray<Execution>
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             match_advanced(
                 env,
@@ -438,10 +558,20 @@ pub contract Seaport {
                 recipient,
             )
         }
-        SeaportMsg::Cancel { orders } -> bool uses (env, ctx: Ctx, ops: mut RawOps, log: mut Log) {
+        SeaportMsg::Cancel { orders } -> bool uses (
+            mut store,
+            guard_state,
+            transient_guard,
+            env,
+            ctx: Ctx,
+            log: mut Log,
+        ) {
             cancel(env, orders)
         }
         SeaportMsg::Validate { orders } -> bool uses (
+            mut store,
+            guard_state,
+            transient_guard,
             env,
             ctx: Ctx,
             call: Call,
@@ -451,26 +581,29 @@ pub contract Seaport {
             validate(env, orders)
         }
         SeaportMsg::IncrementCounter {} -> u256 uses (
+            mut store,
+            guard_state,
+            transient_guard,
             env,
             ctx: Ctx,
-            ops: mut RawOps,
             log: mut Log,
         ) {
             super::status::assert_non_reentrant(env)
             increment_counter()
         }
+        // Match Solidity's view ABI even though deriving the hash is pure.
         SeaportMsg::GetOrderHash { order } -> Bytes32
-        uses (ops: RawOps)
+        uses (ctx: Ctx)
         {
             get_order_hash(order)
         }
         SeaportMsg::GetOrderStatus { orderHash } -> (bool, bool, u256, u256)
-        uses (ops: RawOps)
+        uses (store)
         {
             get_order_status(orderHash)
         }
         SeaportMsg::GetCounter { offerer } -> u256
-        uses (ops: RawOps)
+        uses (store)
         {
             get_counter(offerer)
         }
@@ -480,18 +613,18 @@ pub contract Seaport {
             information(env)
         }
         SeaportMsg::GetContractOffererNonce { contractOfferer } -> u256
-        uses (ops: RawOps)
+        uses (store)
         {
             get_contract_nonce(contractOfferer)
         }
         SeaportMsg::Name {} -> DynString {
-            DynString::from_word_prefix(word: 0x536561706f7274 << 200, len: 7)
+            "Seaport"
         }
-        SeaportMsg::ActivateTstore {} uses (env, ctx: Ctx, call: Call, ops: mut RawOps) {
+        SeaportMsg::ActivateTstore {} uses (mut guard_state, env, ctx: Ctx, call: Call) {
             activate_tstore(env)
         }
         #[payable]
-        _ uses (env, ctx: Ctx, ops: RawOps) {
+        _ uses (guard_state, transient_guard, env, ctx: Ctx, ops: RawOps) {
             receive(env)
         }
     }
@@ -499,9 +632,15 @@ pub contract Seaport {
 
 pub contract Consideration {
     env: Env,
+    #[slot(0)]
+    mut store: OrderStore,
+    #[slot(REENTRANCY_GUARD_SLOT)]
+    mut guard_state: u256,
+    #[slot(REENTRANCY_GUARD_SLOT)]
+    mut transient_guard: TSlot<u256>,
 
     init(conduitController: Address)
-    uses (mut env, ctx: Ctx, call: mut Call, create: mut Create, ops: mut RawOps)
+    uses (mut guard_state, mut env, ctx: Ctx, call: mut Call, create: mut Create)
     {
         env = setup(
             name_hash: CONSIDERATION_NAME_HASH,
@@ -512,6 +651,9 @@ pub contract Consideration {
     recv {
         #[payable]
         SeaportMsg::FulfillBasicOrder {} -> bool uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
             env,
             ctx: Ctx,
             call: mut Call,
@@ -522,13 +664,31 @@ pub contract Consideration {
         }
         #[payable]
         SeaportMsg::FulfillBasicOrderEfficient {} -> bool
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             fulfill_basic_order(env)
         }
         #[payable]
         SeaportMsg::FulfillOrder { order, fulfillerConduitKey } -> bool
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             fulfill_order(env, order, fulfiller_conduit_key: fulfillerConduitKey)
         }
@@ -539,7 +699,16 @@ pub contract Consideration {
             fulfillerConduitKey,
             recipient,
         } -> bool
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             fulfill_advanced_order(
                 env,
@@ -557,7 +726,16 @@ pub contract Consideration {
             fulfillerConduitKey,
             maximumFulfilled,
         } -> (DynArray<bool>, DynArray<Execution>)
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             fulfill_available_orders(
                 env,
@@ -578,7 +756,16 @@ pub contract Consideration {
             recipient,
             maximumFulfilled,
         } -> (DynArray<bool>, DynArray<Execution>)
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             fulfill_available_advanced(
                 env,
@@ -593,7 +780,16 @@ pub contract Consideration {
         }
         #[payable]
         SeaportMsg::MatchOrders { orders, fulfillments } -> DynArray<Execution>
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             match_orders(env, orders, fulfillments_in: fulfillments)
         }
@@ -604,7 +800,16 @@ pub contract Consideration {
             fulfillments,
             recipient,
         } -> DynArray<Execution>
-        uses (env, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+        uses (
+            mut store,
+            mut guard_state,
+            mut transient_guard,
+            env,
+            ctx: Ctx,
+            call: mut Call,
+            ops: mut RawOps,
+            log: mut Log,
+        )
         {
             match_advanced(
                 env,
@@ -614,10 +819,20 @@ pub contract Consideration {
                 recipient,
             )
         }
-        SeaportMsg::Cancel { orders } -> bool uses (env, ctx: Ctx, ops: mut RawOps, log: mut Log) {
+        SeaportMsg::Cancel { orders } -> bool uses (
+            mut store,
+            guard_state,
+            transient_guard,
+            env,
+            ctx: Ctx,
+            log: mut Log,
+        ) {
             cancel(env, orders)
         }
         SeaportMsg::Validate { orders } -> bool uses (
+            mut store,
+            guard_state,
+            transient_guard,
             env,
             ctx: Ctx,
             call: Call,
@@ -627,26 +842,29 @@ pub contract Consideration {
             validate(env, orders)
         }
         SeaportMsg::IncrementCounter {} -> u256 uses (
+            mut store,
+            guard_state,
+            transient_guard,
             env,
             ctx: Ctx,
-            ops: mut RawOps,
             log: mut Log,
         ) {
             super::status::assert_non_reentrant(env)
             increment_counter()
         }
+        // Match Solidity's view ABI even though deriving the hash is pure.
         SeaportMsg::GetOrderHash { order } -> Bytes32
-        uses (ops: RawOps)
+        uses (ctx: Ctx)
         {
             get_order_hash(order)
         }
         SeaportMsg::GetOrderStatus { orderHash } -> (bool, bool, u256, u256)
-        uses (ops: RawOps)
+        uses (store)
         {
             get_order_status(orderHash)
         }
         SeaportMsg::GetCounter { offerer } -> u256
-        uses (ops: RawOps)
+        uses (store)
         {
             get_counter(offerer)
         }
@@ -656,18 +874,18 @@ pub contract Consideration {
             information(env)
         }
         SeaportMsg::GetContractOffererNonce { contractOfferer } -> u256
-        uses (ops: RawOps)
+        uses (store)
         {
             get_contract_nonce(contractOfferer)
         }
         SeaportMsg::Name {} -> DynString {
-            DynString::from_word_prefix(word: 0x436f6e73696465726174696f6e << 152, len: 13)
+            "Consideration"
         }
-        SeaportMsg::ActivateTstore {} uses (env, ctx: Ctx, call: Call, ops: mut RawOps) {
+        SeaportMsg::ActivateTstore {} uses (mut guard_state, env, ctx: Ctx, call: Call) {
             activate_tstore(env)
         }
         #[payable]
-        _ uses (env, ctx: Ctx, ops: RawOps) {
+        _ uses (guard_state, transient_guard, env, ctx: Ctx, ops: RawOps) {
             receive(env)
         }
     }

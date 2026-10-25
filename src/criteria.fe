@@ -2,7 +2,7 @@
 // CriteriaResolution: resolve criteria-based items to concrete identifiers
 // with Merkle proofs.
 use std::evm::{keccak_words, revert_error}
-use super::arr::Arr
+use core::ptr::MemArray
 use super::errors::{
     ConsiderationCriteriaResolverOutOfRange,
     CriteriaNotEnabledForItem,
@@ -16,24 +16,24 @@ use super::model::{Book, Item, OrderState, Resolver, Resolvers}
 use super::types::{CONTRACT, OFFER}
 
 /// `_applyCriteriaResolvers`
-pub fn apply_criteria_resolvers(_ book: Book, _ resolvers: Resolvers) {
-    let total_orders = book.orders.len()
-    let mut i: u256 = 0
-    while i < resolvers.list.len() {
-        let resolver = *resolvers.list.at(i)
+pub fn apply_criteria_resolvers(_ book: mut Book, _ resolvers: Resolvers) {
+    let total_orders = book.orders.len() as u256
+    var i: u256 = 0
+    while i < resolvers.list.len() as u256 {
+        let resolver = resolvers.list[(i) as usize]
         if resolver.order_index >= total_orders {
             revert_error(
                 OrderCriteriaResolverOutOfRange { side: resolver.side.downcast_truncate() },
             )
         }
-        let order = book.order(resolver.order_index)
+        let order = ref book.orders[(resolver.order_index) as usize]
         if order.numerator != 0 {
             if resolver.side != OFFER as u256 {
                 if resolver.index >= order.consideration_len {
                     revert_error(ConsiderationCriteriaResolverOutOfRange {})
                 }
                 update_criteria_item(
-                    book.consideration_item(order, resolver.index),
+                    mut book.items[(order.consideration_start + resolver.index) as usize],
                     resolver,
                     proofs: resolvers.proofs,
                 )
@@ -42,7 +42,7 @@ pub fn apply_criteria_resolvers(_ book: Book, _ resolvers: Resolvers) {
                     revert_error(OfferCriteriaResolverOutOfRange {})
                 }
                 update_criteria_item(
-                    book.offer_item(order, resolver.index),
+                    mut book.items[(order.offer_start + resolver.index) as usize],
                     resolver,
                     proofs: resolvers.proofs,
                 )
@@ -52,11 +52,14 @@ pub fn apply_criteria_resolvers(_ book: Book, _ resolvers: Resolvers) {
     }
     i = 0
     while i < total_orders {
-        let order = book.order(i)
+        let order = ref book.orders[(i) as usize]
         if order.numerator != 0 {
-            let mut j: u256 = 0
+            var j: u256 = 0
             while j < order.consideration_len {
-                if requires_resolution(book.consideration_item(order, j), order.order_type) {
+                if requires_resolution(
+                    ref book.items[(order.consideration_start + j) as usize],
+                    order.order_type,
+                ) {
                     revert_error(
                         UnresolvedConsiderationCriteria { orderIndex: i, considerationIndex: j },
                     )
@@ -65,7 +68,10 @@ pub fn apply_criteria_resolvers(_ book: Book, _ resolvers: Resolvers) {
             }
             j = 0
             while j < order.offer_len {
-                if requires_resolution(book.offer_item(order, j), order.order_type) {
+                if requires_resolution(
+                    ref book.items[(order.offer_start + j) as usize],
+                    order.order_type,
+                ) {
                     revert_error(UnresolvedOfferCriteria { orderIndex: i, offerIndex: j })
                 }
                 j += 1
@@ -76,11 +82,11 @@ pub fn apply_criteria_resolvers(_ book: Book, _ resolvers: Resolvers) {
 }
 
 /// Criteria items stay unresolved only as wildcards of contract orders.
-fn requires_resolution(_ item: *Item, _ order_type: u256) -> bool {
+fn requires_resolution(_ item: Item, _ order_type: u256) -> bool {
     item.item_type > 3 && (order_type != CONTRACT as u256 || item.identifier != 0)
 }
 
-fn update_criteria_item(_ item: *Item, _ resolver: Resolver, proofs: Arr<u256>) {
+fn update_criteria_item(_ item: mut Item, _ resolver: Resolver, proofs: MemArray<u256>) {
     if item.item_type <= 3 {
         revert_error(CriteriaNotEnabledForItem {})
     }
@@ -100,11 +106,11 @@ fn update_criteria_item(_ item: *Item, _ resolver: Resolver, proofs: Arr<u256>) 
 }
 
 /// `_verifyProof`: sorted-pair Merkle proof of `keccak256(leaf)`.
-pub fn verify_proof(leaf: u256, root: u256, proofs: Arr<u256>, start: u256, len: u256) {
-    let mut computed = keccak_words([leaf])
-    let mut i: u256 = 0
+pub fn verify_proof(leaf: u256, root: u256, proofs: MemArray<u256>, start: u256, len: u256) {
+    var computed = keccak_words([leaf])
+    var i: u256 = 0
     while i < len {
-        let element = *proofs.at(start + i)
+        let element = proofs[(start + i) as usize]
         computed = if computed > element {
             keccak_words([element, computed])
         } else {
