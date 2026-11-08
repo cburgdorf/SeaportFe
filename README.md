@@ -46,14 +46,18 @@ and write order status slots directly).
 ## Compiler
 
 This branch targets Fe master
-[`e8612c21dac623431d2a9a34b89216f9008040b7`](https://github.com/argotorg/fe/commit/e8612c21dac623431d2a9a34b89216f9008040b7),
+[`22b156fffc794bb25eaf4dac124ff71ae5aa01e1`](https://github.com/argotorg/fe/commit/22b156fffc794bb25eaf4dac124ff71ae5aa01e1),
 which includes mutable value semantics (MVS), `usize` collection lengths
-([argotorg/fe#1810](https://github.com/argotorg/fe/pull/1810)) and the `Wei`
-and `Timestamp` units ([argotorg/fe#1719](https://github.com/argotorg/fe/pull/1719)).
+([argotorg/fe#1810](https://github.com/argotorg/fe/pull/1810)), the `Wei`
+and `Timestamp` units ([argotorg/fe#1719](https://github.com/argotorg/fe/pull/1719)),
+portable `usize` casts ([argotorg/fe#1883](https://github.com/argotorg/fe/pull/1883))
+and owning `DynArray` and `Bytes`
+([argotorg/fe#1914](https://github.com/argotorg/fe/pull/1914)).
 Protocol amounts and times, and the order model's item positions, stay
-`u256`; they are converted where they meet a collection length or an EVM
-call. Its committed Cargo dependencies pin
-Sonatina `6bd0ce661ea327c149429b00fee3c8608616040f`.
+`u256`; they are converted where they meet a collection length, a memory
+offset or an EVM call, with `downcast_unchecked`, which is exact on the EVM.
+Its committed Cargo dependencies pin
+Sonatina `37c7c0aa8097310872ad3a484b23463c0e38cfc0`.
 `scripts/bootstrap.py` builds this exact compiler with `cargo build --locked
 --release -p fe`, without dependency substitutions or compiler patches, and
 the contracts at `-Os`. The compiler and reference revisions and the build
@@ -94,42 +98,53 @@ historical toolchain; neither is used to build this branch.
 ## Size and gas
 
 Runtime bytes and receipt gas with the compiler above at `-Os` (the build
-level) and at `-O1`. Before: the contracts before the size work (#2) on the
-same compiler at `-O1`. solc: the pinned Seaport's optimized artifacts.
+level) and at `-O1`. Before: the contracts before the size work (#2) on Fe
+e8612c21d at `-O1`. solc: the pinned Seaport's optimized artifacts.
 Receipt gas comes from `tests/rooted-storage.cjs` in transient guard mode, on
 identical calls.
 
 | Contract | Before | `-Os` | `-O1` | solc |
 | --- | ---: | ---: | ---: | ---: |
-| Seaport | 52,760 | 21,705 | 22,714 | 23,963 |
-| Consideration | 52,766 | 21,711 | 22,720 | 23,969 |
-| Conduit | 3,514 | 2,478 | 2,513 | 2,850 |
-| ConduitController | 6,305 | 5,038 | 5,070 | 7,298 |
-| TransferHelper | 4,318 | 3,519 | 3,591 | 3,712 |
-| SeaportRouter | 10,688 | 4,883 | 5,009 | 6,759 |
-| PausableZone | 6,498 | 5,674 | 5,693 | 6,162 |
-| PausableZoneController | 12,731 | 11,784 | 11,924 | 12,730 |
-| Total | 149,580 | 76,792 | 79,234 | 87,443 |
+| Seaport | 52,760 | 21,513 | 22,566 | 23,963 |
+| Consideration | 52,766 | 21,519 | 22,572 | 23,969 |
+| Conduit | 3,514 | 2,429 | 2,472 | 2,850 |
+| ConduitController | 6,305 | 4,985 | 5,071 | 7,298 |
+| TransferHelper | 4,318 | 3,442 | 3,517 | 3,712 |
+| SeaportRouter | 10,688 | 4,708 | 4,906 | 6,759 |
+| PausableZone | 6,498 | 6,430 | 6,709 | 6,162 |
+| PausableZoneController | 12,731 | 13,316 | 13,307 | 12,730 |
+| Total | 149,580 | 78,342 | 81,120 | 87,443 |
 
 | Call | Before | `-Os` | `-O1` | solc |
 | --- | ---: | ---: | ---: | ---: |
-| Advanced ERC721/native self fulfillment | 127,430 | 111,923 | 112,192 | 113,085 |
-| Validate one order | 56,227 | 40,289 | 40,162 | 40,064 |
-| Cancel one order | 40,223 | 32,765 | 32,734 | 33,272 |
-| Increment counter | 29,167 | 27,967 | 27,967 | 27,976 |
-| getOrderStatus (cold) | 25,002 | 23,770 | 23,770 | 23,669 |
-| name (cold) | 22,483 | 21,288 | 21,288 | 21,240 |
-| getCounter (cold) | 24,085 | 24,055 | 24,055 | 24,109 |
-| Create conduit | 816,316 | 608,449 | 615,470 | 676,738 |
-| Create zone | 1,371,276 | 1,205,571 | 1,209,503 | 1,297,167 |
-| Open a channel | 120,229 | 120,214 | 120,227 | 120,891 |
-| Transfer conduit ownership | 49,806 | 49,806 | 49,806 | 50,233 |
+| Advanced ERC721/native self fulfillment | 127,430 | 111,796 | 111,916 | 113,085 |
+| Validate one order | 56,227 | 40,276 | 40,148 | 40,064 |
+| Cancel one order | 40,223 | 32,735 | 32,468 | 33,272 |
+| Increment counter | 29,167 | 27,967 | 28,013 | 27,976 |
+| getOrderStatus (cold) | 25,002 | 23,770 | 23,816 | 23,669 |
+| name (cold) | 22,483 | 21,288 | 21,334 | 21,240 |
+| getCounter (cold) | 24,085 | 24,055 | 23,837 | 24,109 |
+| Create conduit | 816,316 | 598,589 | 607,109 | 676,738 |
+| Create zone | 1,371,276 | 1,357,248 | 1,413,672 | 1,297,167 |
+| Open a channel | 120,229 | 120,214 | 120,273 | 120,891 |
+| Transfer conduit ownership | 49,806 | 49,806 | 49,697 | 50,233 |
 
-Every contract is below its solc size at both levels, and
-Seaport/Consideration fit under the 24,576-byte EIP-170 limit. Of the
-measured calls, only validateOrder (+225 at `-Os`), getOrderStatus (+101), the
-zone controller's assignOperator (+87) and pause (+71), and the name getter
-(+48) cost more than with solc.
+Every contract except PausableZone and PausableZoneController is below its
+solc size at both levels, and Seaport/Consideration fit under the
+24,576-byte EIP-170 limit. Of the measured calls, only validateOrder (+212 at
+`-Os`), getOrderStatus (+101), zone creation (+60,081), the zone controller's
+assignOperator (+85) and pause (+69), and the name getter (+48) cost more
+than with solc.
+
+Against Fe e8612c21d at `-Os` (Seaport 21,705 bytes, 76,792 in total),
+Seaport and Consideration shrink by 192 bytes and Conduit, ConduitController,
+TransferHelper and SeaportRouter by 49 to 175. PausableZone grows by 756
+bytes, in its dispatcher and std's ABI validation of the typed order and
+fulfillment arguments. Its controller, which embeds the zone's initcode (751
+bytes larger) and decodes the same arguments, grows by 1,532. Zone
+creation costs 151,677 more gas and removing a channel 80 more; conduit
+creation costs 9,860 less, fulfillment 127, cancellation 30 and validation 13
+less. The table's other calls are unchanged.
 
 Compiler changes behind these numbers, all on Fe master:
 - Messages and custom errors encode into one buffer, and bools as one word
@@ -149,8 +164,9 @@ Compiler changes behind these numbers, all on Fe master:
 
 These results were first reached with size-optimized forks of Fe
 (`sbillig/fe` `opt/seaport-size-20261019`) and Sonatina (`6f264b46`). Against
-that build, Seaport is 228 bytes smaller and fulfillment 55 gas cheaper;
-getOrderStatus costs 50 more and validateOrder 20 more.
+that build, the Fe e8612c21d build's Seaport was 228 bytes smaller and
+fulfillment 55 gas cheaper; getOrderStatus cost 50 more and validateOrder 20
+more.
 
 Contract changes:
 - The fulfillment, match, validate, cancel and getOrderHash arms read their
@@ -209,15 +225,16 @@ starts from a fresh chain. Set `SEAPORT_TRACE_HASHES=1` to count the exact
 transfer, cancellation and acceptance. The test compares full event bytes
 and checks that each event precedes its corresponding storage write.
 
-Fe master e8612c21d builds all eight production contracts at `-Os` and
-`-O1`. The `-Os` build passes all 27 Fe tests, all 482 Foundry tests (1,000
-cases per fuzz test), the full Hardhat suite (402 passing, one pending) and
-`scripts/compare_abi.py`. The rooted-storage differential passes for pinned
-Solidity, the build before the size work and both levels, in transient and
-forced persistent guard modes, including exact storage slots, event bytes,
-map hashes, and log/write ordering. `tests/router-diff.cjs` compares 5,039
-router calls with the solc router and finds only the four documented
-`Panic(0x41)` differences; with `RELATIVE=1`, all 963 shifted calls match.
+Fe master 22b156fff builds all eight production contracts at `-Os` and
+`-O1`, and their ABIs are unchanged from the e8612c21d build. The `-Os` build
+passes all 27 Fe tests, all 482 Foundry tests (1,000 cases per fuzz test), the
+full Hardhat suite (402 passing, one pending) and `scripts/compare_abi.py`.
+The rooted-storage differential passes for pinned Solidity, the e8612c21d
+`-Os` build and both levels, in transient and forced persistent guard modes,
+including exact storage slots, event bytes, map hashes, and log/write
+ordering. `tests/router-diff.cjs` compares 5,039 router calls with the solc
+router and finds only the four documented `Panic(0x41)` differences; with
+`RELATIVE=1`, all 963 shifted calls match.
 
 The build retains the two documented `--both` Foundry differences:
 480 pass and `testRevertErc20Transfer` / `testMatchAuthRevertAndInvMagicValue`
@@ -305,10 +322,12 @@ checks exactly these differences.
   order leaves open gets the truncated address. seaport-core keeps the raw
   word. Returned items that have an original are still compared word for word.
 - Code size: with the compiler above at `-Os`, the Seaport and Consideration
-  runtimes are 21,705 and 21,711 bytes, under the 24 KB EIP-170 limit
+  runtimes are 21,513 and 21,519 bytes, under the 24 KB EIP-170 limit
   (ISSUES.md #13); see [Size and gas](#size-and-gas). Earlier builds, before
   the size work, were above the limit, and both upstream harnesses lift it.
-  Fe master e8612c21d / committed Sonatina 6bd0ce66 at `-O1` produced
+  Fe master e8612c21d / committed Sonatina 6bd0ce66 at `-Os` produced
+  21,705/21,711-byte Seaport/Consideration runtimes and periphery runtimes of
+  2,478 to 11,784 bytes; before the size work, at `-O1`, it produced
   52,760/52,766-byte Seaport/Consideration runtimes and periphery runtimes of
   3,514 to 12,731 bytes. Fe master fa06c6cd5 / Sonatina fcdbdc4d produced
   53,579/53,585-byte Seaport/Consideration runtimes and periphery runtimes of
@@ -324,8 +343,10 @@ checks exactly these differences.
   this storage refactor.
 - Gas: validateOrder, getOrderStatus, the name getter and the zone
   controller's assignOperator and pause still cost more than seaport-core's
-  hand-optimized assembly; see [Size and gas](#size-and-gas). The October 11
-  upstream behavioral suites, including gas-budget cases, pass. The following
+  hand-optimized assembly, and zone creation costs more because the
+  PausableZone runtime is larger than solc's; see
+  [Size and gas](#size-and-gas). The October 11 upstream behavioral suites,
+  including gas-budget cases, pass. The following
   pre-MVS measurements are historical; these calls
   came from one Foundry test (`test_fuzzCoverage_x`):
 

@@ -219,8 +219,8 @@ affected too.
 
 ## 13. Runtime code is far above EIP-170
 
-Status: fixed. On Fe master e8612c21d at `-Os`, `Seaport` is 21,705 bytes and
-`Consideration` 21,711, below solc; see the README's Size and gas section.
+Status: fixed. On Fe master 22b156fff at `-Os`, `Seaport` is 21,513 bytes and
+`Consideration` 21,519, below solc; see the README's Size and gas section.
 Earlier, rebasing onto upstream PR #1618 had reduced it from 154 KB to 65 KB.
 
 With `-O 1` the Fe `Seaport` runtime is about 154 KB (Solidity: just under
