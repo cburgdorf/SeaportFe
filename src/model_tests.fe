@@ -1,4 +1,5 @@
 use core::abi::{AbiSize, Encode}
+use core::mem::forget
 use core::ptr::MemBuffer
 use std::abi::{Bytes, Bytes32, DynArray, Sol, dyn_array_from, sol::Uint120}
 use std::evm::{Address, Evm, Wei, encode_abi_payload, keccak_words}
@@ -24,9 +25,12 @@ fn pair<T>(_ values: own (T, T)) -> DynArray<T> where T: Encode<Sol> + AbiSize {
     data.write_word(offset: 0, value: 2)
     data.copy_from(dest_offset: 32, elements.span())
     // A complete ABI tail: the length word followed by the pair's encoding.
-    unsafe {
+    // The array takes over the buffer's allocation.
+    let array = unsafe {
         DynArray::from_abi_tail(data: data.ptr(), len: 2, size: data.len() as u256)
     }
+    forget(data)
+    array
 }
 
 fn order(_ identifier: u256, amount: u256) -> AdvancedOrder {

@@ -64,8 +64,6 @@ pub struct ZoneIsPaused {}
 #[abi]
 pub struct Schema { pub id: u256, pub metadata: Bytes }
 
-impl Copy for Schema {}
-
 const ZONE_INTERFACE_ID: u256 = 0x39dd6933
 const ERC165_INTERFACE_ID: u256 = 0x01ffc9a7
 const AUTHORIZE_ORDER_SELECTOR: u256 = 0x01e4d72a

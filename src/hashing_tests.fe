@@ -14,8 +14,8 @@ pub fn deploy_seaport() -> Address uses (evm: mut Evm) {
 
 /// `getOrderHash`, which hashes its calldata argument.
 fn hash_components(
-    offer: DynArray<OfferItem>,
-    consideration: DynArray<ConsiderationItem>,
+    offer: own DynArray<OfferItem>,
+    consideration: own DynArray<ConsiderationItem>,
     counter: u256,
 ) -> u256
 uses (evm: mut Evm)

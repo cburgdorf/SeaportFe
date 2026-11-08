@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // An initialized, exclusively owned byte buffer for exact protocol encodings.
 use core::abi::AbiSize
+use core::mem::forget
 use core::ptr::{self, MemArray, MemBuffer, MemSpan}
 use std::abi::DynArray
 use std::evm::{Panic, PANIC_INDEX_OUT_OF_BOUNDS, RawOps}
@@ -139,28 +140,34 @@ impl Buffer {
         if T::IS_DYNAMIC {
             core::panic()
         }
-        // `from_abi_tail` validates a static element array completely.
-        unsafe {
+        // `from_abi_tail` validates a static element array completely. The
+        // array takes over the buffer's allocation.
+        let array = unsafe {
             DynArray::from_abi_tail(
                 data: self.data.ptr(),
                 len: len.downcast_unchecked(),
                 size: self.len(),
             )
         }
+        forget(self)
+        array
     }
     /// The buffer as the ABI tail of a `len` element array of any `T`. The
     /// caller must ensure the buffer is the length word `len`, the element
-    /// heads and valid tails ending at the buffer's end.
+    /// heads and valid tails ending at the buffer's end. The array takes over
+    /// the buffer's allocation.
     pub unsafe fn into_dyn_array_unvalidated<T>(own self, len: u256) -> DynArray<T>
     where T: AbiSize
     {
-        unsafe {
+        let array = unsafe {
             DynArray::from_abi_tail(
                 data: self.data.ptr(),
                 len: len.downcast_unchecked(),
                 size: self.len(),
             )
         }
+        forget(self)
+        array
     }
 }
 

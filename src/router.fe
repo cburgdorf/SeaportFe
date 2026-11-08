@@ -146,10 +146,11 @@ uses (
     } else {
         Address::from_word_truncate(recipient_word)
     }
-    let no_available = DynArray<bool>::empty()
-    let no_executions = DynArray<Execution>::empty()
-    var available_parts = MemArray::from_fn(count.downcast_unchecked(), |_| no_available)
-    var execution_parts = MemArray::from_fn(count.downcast_unchecked(), |_| no_executions)
+    var available_parts = MemArray::from_fn(count.downcast_unchecked(), |_| DynArray<bool>::empty())
+    var execution_parts = MemArray::from_fn(
+        count.downcast_unchecked(),
+        |_| DynArray<Execution>::empty(),
+    )
     var fulfillments_left = maximum_fulfilled
     var i: u256 = 0
     while i < count {
@@ -181,7 +182,7 @@ uses (
                 .into_dyn_array(len: available.word(0))
             execution_parts[i.downcast_unchecked()] = executions
                 .into_dyn_array(len: executions.word(0))
-            let flags = available_parts[i.downcast_unchecked()]
+            let flags = ref available_parts[i.downcast_unchecked()]
             // Upstream only advances `j` for available orders, so an
             // unavailable order loops until the call runs out of gas.
             var j: usize = 0
@@ -660,7 +661,7 @@ where T: AbiSize
 {
     let count = parts.len()
     var size = 32 + count as u256 * 32
-    for part in parts.as_slice() {
+    for ref part in parts.as_slice() {
         size += part.encoded_size()
     }
     let data = ptr::alloc_bytes(size.downcast_unchecked())
@@ -669,7 +670,7 @@ where T: AbiSize
     unsafe {
         *ptr::cast<u8, u256>(data) = count as u256
         var tail = count as u256 * 32
-        for (i, part) in parts.as_slice().enumerate() {
+        for (i, ref part) in parts.as_slice().enumerate() {
             *ptr::cast<u8, u256>(ptr::offset_bytes(data, 32 + i * 32)) = tail
             ptr::copy(
                 dest: ptr::offset_bytes(data, (32 + tail).downcast_unchecked()),
