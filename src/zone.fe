@@ -137,7 +137,10 @@ fn write_hashes(_ dst: mut Buffer, offset: u256, _ hashes: MemArray<u256>, count
         dst.put(offset, value: count)
         var i: u256 = 0
         while i < count {
-            dst.put(offset: offset + 32 + i * 32, value: hashes[(i) as usize])
+            dst.put(
+                offset: offset + 32 + i * 32,
+                value: hashes[i.downcast_unchecked()],
+            )
             i += 1
         }
     }
@@ -577,10 +580,10 @@ uses (ops: mut RawOps)
         original_consideration
     }
     let used = start + offer_length + consideration_length
-    var items = MemArray<Item>::new_zeroed(used as usize)
+    var items = MemArray<Item>::new_zeroed(used.downcast_unchecked())
     var i: u256 = 0
     while i < start {
-        items[(i) as usize] = book.items[(i) as usize]
+        items[i.downcast_unchecked()] = book.items[i.downcast_unchecked()]
         i += 1
     }
     // Offer items, then consideration items; returned tokens and recipients
@@ -599,7 +602,7 @@ uses (ops: mut RawOps)
         } else {
             Address::zero()
         }
-        items[(start + i) as usize] = Item {
+        items[(start + i).downcast_unchecked()] = Item {
             item_type: returndata_word(base),
             token: Address::from_word_truncate(returndata_word(base + 32)),
             identifier: returndata_word(base + 64),

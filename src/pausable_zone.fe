@@ -353,7 +353,7 @@ fn assert_owner(_ owner: u256) uses (ctx: Ctx) {
 
 fn zone_init_code_hash() -> u256 uses (ops: mut RawOps) {
     let len = <PausableZone as Contract>::init_code_len()
-    var code = MemBuffer::with_capacity(len as usize)
+    var code = MemBuffer::with_capacity(len.downcast_unchecked())
     ops.codecopy(
         dest: mut code,
         dest_offset: 0,

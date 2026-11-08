@@ -227,7 +227,7 @@ pub fn call_component_words<const N: usize>(
 ) -> (bool, u256, u256)
 uses (evm: mut Evm)
 {
-    let data = MemBuffer::alloc((36 + (N as u256) * 32) as usize)
+    let data = MemBuffer::new(36 + N * 32)
     // `data` holds the selector and every word.
     unsafe {
         store_word(ptr: data.ptr(), value: selector << 224)
@@ -236,20 +236,20 @@ uses (evm: mut Evm)
     while i < N {
         unsafe {
             store_word(
-                ptr: ptr::offset_bytes(data.ptr(), 4 + (i as u256) * 32),
+                ptr: ptr::offset_bytes(data.ptr(), 4 + i * 32),
                 value: words[i],
             )
         }
         i += 1
     }
-    var ret = MemBuffer::alloc(32)
+    var ret = MemBuffer::new(32)
     let result = evm
         .raw_call(
             addr,
             gas: 100000,
             value: Wei::zero(),
             args: unsafe {
-                MemSpan::from_raw_parts(ptr: data.ptr(), len: len as usize)
+                MemSpan::from_raw_parts(ptr: data.ptr(), len: len.downcast_unchecked())
             },
             ret: mut ret,
         )

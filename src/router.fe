@@ -148,8 +148,8 @@ uses (
     }
     let no_available = DynArray<bool>::empty()
     let no_executions = DynArray<Execution>::empty()
-    var available_parts = MemArray::from_fn(count as usize, |_| no_available)
-    var execution_parts = MemArray::from_fn(count as usize, |_| no_executions)
+    var available_parts = MemArray::from_fn(count.downcast_unchecked(), |_| no_available)
+    var execution_parts = MemArray::from_fn(count.downcast_unchecked(), |_| no_executions)
     var fulfillments_left = maximum_fulfilled
     var i: u256 = 0
     while i < count {
@@ -177,9 +177,11 @@ uses (
         if outcome.success() {
             let available = decode_result_array(returned, head: 0, stride: 32, executions: false)
             let executions = decode_result_array(returned, head: 32, stride: 0xe0, executions: true)
-            available_parts[i as usize] = available.into_dyn_array(len: available.word(0))
-            execution_parts[i as usize] = executions.into_dyn_array(len: executions.word(0))
-            let flags = available_parts[i as usize]
+            available_parts[i.downcast_unchecked()] = available
+                .into_dyn_array(len: available.word(0))
+            execution_parts[i.downcast_unchecked()] = executions
+                .into_dyn_array(len: executions.word(0))
+            let flags = available_parts[i.downcast_unchecked()]
             // Upstream only advances `j` for available orders, so an
             // unavailable order loops until the call runs out of gas.
             var j: usize = 0
@@ -406,7 +408,8 @@ fn emit_copy(_ out: *u8, write: bool, at: u256, source: u256, len: u256) {
     if write {
         // The sizing pass measured the buffer for every copied range.
         unsafe {
-            CalldataView::at(source).copy_to(ptr::offset_bytes(out, at), len: len)
+            CalldataView::at(source)
+                .copy_to(ptr::offset_bytes(out, at.downcast_unchecked()), len: len)
         }
     }
 }
@@ -643,7 +646,10 @@ fn decode_result_array(_ data: MemSpan, head: u256, stride: u256, executions: bo
     var copy = Buffer::new(32 + size)
     copy.copy_from(
         offset: 0,
-        source: data.slice(offset: pos as usize, len: (32 + size) as usize),
+        source: data.slice(
+            offset: pos.downcast_unchecked(),
+            len: (32 + size).downcast_unchecked(),
+        ),
     )
     copy
 }
@@ -657,16 +663,16 @@ where T: AbiSize
     for part in parts.as_slice() {
         size += part.encoded_size()
     }
-    let data = ptr::alloc_bytes(size)
+    let data = ptr::alloc_bytes(size.downcast_unchecked())
     // The allocation holds the length word, a head per part and a copy of
     // each part's complete encoding, which ends exactly at `size`.
     unsafe {
         *ptr::cast<u8, u256>(data) = count as u256
         var tail = count as u256 * 32
         for (i, part) in parts.as_slice().enumerate() {
-            *ptr::cast<u8, u256>(ptr::offset_bytes(data, 32 + i as u256 * 32)) = tail
+            *ptr::cast<u8, u256>(ptr::offset_bytes(data, 32 + i * 32)) = tail
             ptr::copy(
-                dest: ptr::offset_bytes(data, 32 + tail),
+                dest: ptr::offset_bytes(data, (32 + tail).downcast_unchecked()),
                 source: part.encoded_span(),
             )
             tail += part.encoded_size()

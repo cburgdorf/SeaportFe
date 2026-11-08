@@ -142,9 +142,9 @@ uses (log: mut Log)
     let consideration_at = 0x1a0 + offer_size
     let consideration_size = 32 + order.consideration_len * 192
     let size = consideration_at + consideration_size
-    let data = ptr::alloc_bytes(size)
+    let data = ptr::alloc_bytes(size.downcast_unchecked())
     let offer = ptr::offset_bytes(data, 0x1a0)
-    let consideration = ptr::offset_bytes(data, consideration_at)
+    let consideration = ptr::offset_bytes(data, consideration_at.downcast_unchecked())
     let p = order.params
     // Every word of the `size` bytes allocated above is written: the order
     // type through the original consideration count, then each item array
@@ -179,7 +179,7 @@ uses (log: mut Log)
     )
     log.log1(
         data: unsafe {
-            ptr::MemSpan::from_raw_parts(ptr: data, len: size as usize)
+            ptr::MemSpan::from_raw_parts(ptr: data, len: size.downcast_unchecked())
         },
         topic0: OrderValidated::TOPIC0,
     )
@@ -193,7 +193,7 @@ fn clean_items(_ items: *u8, count: u256, consideration: bool) {
     let stride: u256 = if consideration { 192 } else { 160 }
     var i: u256 = 0
     while i < count {
-        let item = ptr::offset_bytes(items, 32 + i * stride)
+        let item = ptr::offset_bytes(items, (32 + i * stride).downcast_unchecked())
         // The item lies in the event buffer written by the caller.
         unsafe {
             let _ = checked_enum(*ptr::cast<u8, u256>(item), variants: 6)

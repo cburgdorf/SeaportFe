@@ -81,7 +81,7 @@ pub fn derive_components_hash(_ order: CalldataView) -> u256 {
 #[arithmetic(unchecked)]
 #[inline(always)]
 fn hash_items(_ items: CalldataView, count: u256, consideration: bool) -> u256 {
-    let hashes = ptr::alloc_bytes(count * 32)
+    let hashes = ptr::alloc_bytes((count * 32).downcast_unchecked())
     var i: u256 = 0
     while i < count {
         let hash = if consideration {
@@ -112,13 +112,16 @@ fn hash_items(_ items: CalldataView, count: u256, consideration: bool) -> u256 {
         }
         // Hash `i` of the `count` allocated above.
         unsafe {
-            store_word(ptr: ptr::offset_bytes(hashes, i * 32), value: hash)
+            store_word(
+                ptr: ptr::offset_bytes(hashes, (i * 32).downcast_unchecked()),
+                value: hash,
+            )
         }
         i += 1
     }
     keccak256(
         unsafe {
-            MemSpan::from_raw_parts(ptr: hashes, len: (count * 32) as usize)
+            MemSpan::from_raw_parts(ptr: hashes, len: (count * 32).downcast_unchecked())
         },
     )
 }
@@ -176,5 +179,5 @@ const BULK_ORDER_TYPEHASHES: [u256; 24] = [
 pub fn bulk_order_typehash(_ height: u256) -> u256 {
     let index = height.wrapping_sub(1)
     let bounded = if index < 23 { index } else { 23 }
-    BULK_ORDER_TYPEHASHES[bounded as usize]
+    BULK_ORDER_TYPEHASHES[bounded.downcast_unchecked()]
 }

@@ -178,7 +178,11 @@ uses (ctx: Ctx, call: mut Call)
     }
     revert_with_reason3(
         selector,
-        reason: returned.slice(offset: start as usize, len: length as usize),
+        reason: returned
+            .slice(
+                offset: start.downcast_unchecked(),
+                len: length.downcast_unchecked(),
+            ),
         a: recipient.word(),
         b: ctx.caller().word(),
         c: token_id,
@@ -274,7 +278,10 @@ uses (ctx: Ctx, call: mut Call, ops: RawOps)
     match try_decode_error_string(data) {
         Option::Some((at, len)) => revert_with_reason2(
             error_selector<ConduitErrorRevertString>(),
-            reason: data.slice(offset: at as usize, len: len as usize),
+            reason: data.slice(
+                offset: at.downcast_unchecked(),
+                len: len.downcast_unchecked(),
+            ),
             a: conduit_key,
             b: conduit.word(),
         ),

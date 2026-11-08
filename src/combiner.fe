@@ -141,7 +141,7 @@ uses (store: mut OrderStore, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut
     var some_order_available = false
     var i: u256 = 0
     while i < total_orders {
-        if order_hashes[(i) as usize] != 0 {
+        if order_hashes[i.downcast_unchecked()] != 0 {
             let available = prepare_available_order(
                 env,
                 mut book,
@@ -176,10 +176,10 @@ fn validate_and_prepare_order(
 ) -> (bool, bool)
 uses (store: OrderStore, ctx: Ctx, call: Call, ops: RawOps)
 {
-    order_hashes[(index) as usize] = 0
+    order_hashes[index.downcast_unchecked()] = 0
     let (order_hash, numerator, denominator) = validate_order(
         env,
-        order: book.orders[index as usize],
+        order: book.orders[index.downcast_unchecked()],
         revert_on_invalid,
     )
     unsafe {
@@ -194,7 +194,7 @@ uses (store: OrderStore, ctx: Ctx, call: Call, ops: RawOps)
     let order = unsafe {
         ref *element(book.orders.ptr(), index)
     }
-    order_hashes[(index) as usize] = order_hash
+    order_hashes[index.downcast_unchecked()] = order_hash
     let is_non_contract = order.order_type < 4
     var native_offer = false
     // Offer items, then consideration items, which round up.
@@ -263,7 +263,7 @@ uses (store: mut OrderStore, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut
 }
 
 fn skip_available_order(_ book: mut Book, order_hashes: mut MemArray<u256>, index: u256) {
-    order_hashes[(index) as usize] = 0
+    order_hashes[index.downcast_unchecked()] = 0
     unsafe {
         (*element(book.orders.ptr(), index)).numerator = 0
     }
@@ -278,7 +278,7 @@ fn prepare_standard_available_order(
 ) -> bool
 uses (store: mut OrderStore, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
 {
-    let order_hash_slot = ref order_hashes[index as usize]
+    let order_hash_slot = ref order_hashes[index.downcast_unchecked()]
     let order_hash = order_hash_slot
     let available = authorize_and_record(
         mut book,
@@ -310,7 +310,7 @@ fn prepare_contract_available_order(
 uses (store: mut OrderStore, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
 {
     let order_hash = generate_order(book, order_index: index, revert_on_invalid)
-    order_hashes[(index) as usize] = order_hash
+    order_hashes[index.downcast_unchecked()] = order_hash
     if order_hash == 0 {
         unsafe {
             (*element(book.orders.ptr(), index)).numerator = 0
@@ -359,7 +359,7 @@ uses (store: mut OrderStore, ctx: Ctx, call: mut Call, ops: mut RawOps)
             denominator: order.denominator,
             revert_on_invalid: revert_on_failed_update(order, revert_on_invalid),
         ) {
-        order_hashes[(index) as usize] = 0
+        order_hashes[index.downcast_unchecked()] = 0
         unsafe {
             (*element(book.orders.ptr(), index)).numerator = 0
         }
@@ -410,7 +410,7 @@ uses (
     )
     let total_offer = offer_fulfillments.len()
     var executions = MemArray<ExecutionState>::new_zeroed(
-        (offer_fulfillments.len() + consideration_fulfillments.len()) as usize,
+        (offer_fulfillments.len() + consideration_fulfillments.len()).downcast_unchecked(),
     )
     var i: u256 = 0
     while i < total_offer {
@@ -467,7 +467,7 @@ uses (ctx: Ctx)
 {
     aggregate_available(
         mut book,
-        execution: mut executions[(slot) as usize],
+        execution: mut executions[slot.downcast_unchecked()],
         side,
         groups,
         index,
@@ -507,7 +507,7 @@ uses (
     )
     emit_orders_matched(order_hashes)
     let total_fulfillments = fulfillments.len() / 2
-    var executions = MemArray<ExecutionState>::new_zeroed(total_fulfillments as usize)
+    var executions = MemArray<ExecutionState>::new_zeroed(total_fulfillments.downcast_unchecked())
     var i: u256 = 0
     while i < total_fulfillments {
         apply_fulfillment_into(mut book, mut executions, groups: fulfillments, index: i)
@@ -536,7 +536,7 @@ fn apply_fulfillment_into(
 ) {
     apply_fulfillment(
         mut book,
-        execution: mut executions[(index) as usize],
+        execution: mut executions[index.downcast_unchecked()],
         groups,
         fulfillment_index: index,
     )
@@ -623,7 +623,7 @@ fn run_execution(
 ) -> Accumulator
 uses (ctx: Ctx, call: mut Call, ops: RawOps)
 {
-    let execution = executions[(index) as usize]
+    let execution = executions[index.downcast_unchecked()]
     if execution.amount == 0 {
         return acc
     }
@@ -667,7 +667,7 @@ uses (ctx: Ctx, call: mut Call, ops: RawOps)
     if order.numerator == 0 {
         return acc
     }
-    available[(index) as usize] = true
+    available[index.downcast_unchecked()] = true
     var current = acc
     var j: u256 = 0
     while j < order.offer_len {
@@ -721,14 +721,14 @@ fn validate_available_order(
 )
 uses (ctx: Ctx, call: mut Call, ops: RawOps)
 {
-    if available[(index) as usize] {
+    if available[index.downcast_unchecked()] {
         assert_restricted_advanced_order_validity(
             book,
             order: unsafe {
                 ref *element(book.orders.ptr(), index)
             },
             order_hashes: ref order_hashes,
-            order_hash: order_hashes[(index) as usize],
+            order_hash: order_hashes[index.downcast_unchecked()],
         )
     }
 }
@@ -789,7 +789,11 @@ pub fn encode_available(
         unsafe {
             out.put(
                 offset: 0x60 + i * 32,
-                value: if available[i as usize] { 1 } else { 0 },
+                value: if available[i.downcast_unchecked()] {
+                    1
+                } else {
+                    0
+                },
             )
         }
         i += 1
@@ -807,7 +811,7 @@ unsafe fn write_executions(_ base: *u8, _ executions: MemArray<ExecutionState>) 
     let count = executions.len() as u256
     var i: u256 = 0
     while i < count {
-        let e = ref executions[i as usize]
+        let e = ref executions[i.downcast_unchecked()]
         let at = i * 224
         unsafe {
             store_at(base, offset: at, value: e.item_type & 0xff)

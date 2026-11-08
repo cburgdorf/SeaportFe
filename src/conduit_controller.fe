@@ -136,7 +136,7 @@ uses (ctx: Ctx)
 
 fn conduit_init_code_hash() -> u256 uses (ops: mut RawOps) {
     let len = <Conduit as Contract>::init_code_len()
-    var code = MemBuffer::with_capacity(len as usize)
+    var code = MemBuffer::with_capacity(len.downcast_unchecked())
     ops.codecopy(
         dest: mut code,
         dest_offset: 0,

@@ -174,7 +174,7 @@ impl Groups {
 /// whose offset then lies in the allocation.
 #[arithmetic(unchecked)]
 pub fn element<T>(_ base: *T, _ index: u256) -> *T {
-    ptr::offset_bytes(base, index * size_of<T>())
+    ptr::offset_bytes(base, (index * size_of<T>() as u256).downcast_unchecked())
 }
 
 /// Solidity validates protocol enums when their words are read as enums.
@@ -273,7 +273,7 @@ fn build_book(_ input: CalldataView, count: usize, advanced: bool) -> Book {
         i += 1
     }
     var items = unsafe {
-        MemArray<Item>::new_uninit(total as usize)
+        MemArray<Item>::new_uninit(total.downcast_unchecked())
     }
     i = 0
     while i < count {
@@ -299,7 +299,7 @@ fn build_book(_ input: CalldataView, count: usize, advanced: bool) -> Book {
 
 /// The orders of the `AdvancedOrder[]` (`advanced`) or `Order[]` at `input`.
 pub fn orders_book(_ input: CalldataView, advanced: bool) -> Book {
-    build_book(input, count: input.len() as usize, advanced)
+    build_book(input, count: input.len().downcast_unchecked(), advanced)
 }
 
 /// The `AdvancedOrder` (`advanced`) or `Order` that is the first of `args`.

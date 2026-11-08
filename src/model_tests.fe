@@ -20,7 +20,7 @@ use super::types::{
 /// pair is exactly the element section of the array's ABI tail.
 fn pair<T>(_ values: own (T, T)) -> DynArray<T> where T: Encode<Sol> + AbiSize {
     let elements = encode_abi_payload(values)
-    var data = MemBuffer::alloc(32 + elements.len())
+    var data = MemBuffer::new(32 + elements.len())
     data.write_word(offset: 0, value: 2)
     data.copy_from(dest_offset: 32, elements.span())
     // A complete ABI tail: the length word followed by the pair's encoding.
@@ -95,7 +95,7 @@ pub contract ModelHarness {
             let args = CalldataView::arguments(32)
             var book = single_order(args, advanced: true)
             let descriptor = ref book.orders[0]
-            book.items[descriptor.offer_start as usize].amount = 11
+            book.items[descriptor.offer_start.downcast_unchecked()].amount = 11
             assert(descriptor.offer_len == 1)
             assert(descriptor.signature.word(32) >> 248 == 4)
             assert(descriptor.extra_data.word(32) >> 248 == 7)
@@ -112,7 +112,7 @@ pub contract ModelHarness {
             assert(book.orders[0].offer_start == 0)
             assert(book.orders[1].offer_start == 1)
             let second = ref book.orders[1]
-            book.items[second.offer_start as usize].identifier = 99
+            book.items[second.offer_start.downcast_unchecked()].identifier = 99
             assert(second.signature.word(32) >> 248 == 5)
             assert(second.extra_data.word(32) >> 248 == 13)
             assert(book.items[0].identifier == 4)
