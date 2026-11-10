@@ -46,7 +46,7 @@ and write order status slots directly).
 ## Compiler
 
 This branch targets Fe master
-[`22b156fffc794bb25eaf4dac124ff71ae5aa01e1`](https://github.com/argotorg/fe/commit/22b156fffc794bb25eaf4dac124ff71ae5aa01e1),
+[`5cebf09af44eaaf5e81302eecff01d519bf48f7b`](https://github.com/argotorg/fe/commit/5cebf09af44eaaf5e81302eecff01d519bf48f7b),
 which includes mutable value semantics (MVS), `usize` collection lengths
 ([argotorg/fe#1810](https://github.com/argotorg/fe/pull/1810)), the `Wei`
 and `Timestamp` units ([argotorg/fe#1719](https://github.com/argotorg/fe/pull/1719)),
@@ -57,7 +57,7 @@ Protocol amounts and times, and the order model's item positions, stay
 `u256`; they are converted where they meet a collection length, a memory
 offset or an EVM call, with `downcast_unchecked`, which is exact on the EVM.
 Its committed Cargo dependencies pin
-Sonatina `37c7c0aa8097310872ad3a484b23463c0e38cfc0`.
+Sonatina `5a44318d34c0701eaedf9e3485d5241459820cbb`.
 `scripts/bootstrap.py` builds this exact compiler with `cargo build --locked
 --release -p fe`, without dependency substitutions or compiler patches, and
 the contracts at `-Os`. The compiler and reference revisions and the build
@@ -105,46 +105,45 @@ identical calls.
 
 | Contract | Before | `-Os` | `-O1` | solc |
 | --- | ---: | ---: | ---: | ---: |
-| Seaport | 52,760 | 21,513 | 22,566 | 23,963 |
-| Consideration | 52,766 | 21,519 | 22,572 | 23,969 |
+| Seaport | 52,760 | 21,696 | 23,058 | 23,963 |
+| Consideration | 52,766 | 21,702 | 23,064 | 23,969 |
 | Conduit | 3,514 | 2,429 | 2,472 | 2,850 |
-| ConduitController | 6,305 | 4,985 | 5,071 | 7,298 |
-| TransferHelper | 4,318 | 3,442 | 3,517 | 3,712 |
-| SeaportRouter | 10,688 | 4,708 | 4,906 | 6,759 |
-| PausableZone | 6,498 | 6,430 | 6,709 | 6,162 |
-| PausableZoneController | 12,731 | 13,316 | 13,307 | 12,730 |
-| Total | 149,580 | 78,342 | 81,120 | 87,443 |
+| ConduitController | 6,305 | 4,985 | 5,097 | 7,298 |
+| TransferHelper | 4,318 | 3,264 | 3,356 | 3,712 |
+| SeaportRouter | 10,688 | 4,630 | 4,806 | 6,759 |
+| PausableZone | 6,498 | 5,920 | 6,073 | 6,162 |
+| PausableZoneController | 12,731 | 12,247 | 12,577 | 12,730 |
+| Total | 149,580 | 76,873 | 80,503 | 87,443 |
 
 | Call | Before | `-Os` | `-O1` | solc |
 | --- | ---: | ---: | ---: | ---: |
-| Advanced ERC721/native self fulfillment | 127,430 | 111,796 | 111,916 | 113,085 |
-| Validate one order | 56,227 | 40,276 | 40,148 | 40,064 |
-| Cancel one order | 40,223 | 32,735 | 32,468 | 33,272 |
+| Advanced ERC721/native self fulfillment | 127,430 | 111,774 | 111,777 | 113,085 |
+| Validate one order | 56,227 | 40,276 | 39,992 | 40,064 |
+| Cancel one order | 40,223 | 32,735 | 32,443 | 33,272 |
 | Increment counter | 29,167 | 27,967 | 28,013 | 27,976 |
-| getOrderStatus (cold) | 25,002 | 23,770 | 23,816 | 23,669 |
+| getOrderStatus (cold) | 25,002 | 23,720 | 23,766 | 23,669 |
 | name (cold) | 22,483 | 21,288 | 21,334 | 21,240 |
 | getCounter (cold) | 24,085 | 24,055 | 23,837 | 24,109 |
 | Create conduit | 816,316 | 598,589 | 607,109 | 676,738 |
-| Create zone | 1,371,276 | 1,357,248 | 1,413,672 | 1,297,167 |
-| Open a channel | 120,229 | 120,214 | 120,273 | 120,891 |
+| Create zone | 1,371,276 | 1,254,904 | 1,285,657 | 1,297,167 |
+| Open a channel | 120,229 | 120,214 | 120,276 | 120,891 |
 | Transfer conduit ownership | 49,806 | 49,806 | 49,697 | 50,233 |
 
-Every contract except PausableZone and PausableZoneController is below its
-solc size at both levels, and Seaport/Consideration fit under the
-24,576-byte EIP-170 limit. Of the measured calls, only validateOrder (+212 at
-`-Os`), getOrderStatus (+101), zone creation (+60,081), the zone controller's
-assignOperator (+85) and pause (+69), and the name getter (+48) cost more
-than with solc.
+Every contract is below its solc size at both levels, and Seaport and
+Consideration fit under the 24,576-byte EIP-170 limit. Of the measured calls,
+only validateOrder (+212 at `-Os`), getOrderStatus (+51), the zone
+controller's assignOperator (+76) and pause (+60), and the name getter (+48)
+cost more than with solc.
 
-Against Fe e8612c21d at `-Os` (Seaport 21,705 bytes, 76,792 in total),
-Seaport and Consideration shrink by 192 bytes and Conduit, ConduitController,
-TransferHelper and SeaportRouter by 49 to 175. PausableZone grows by 756
-bytes, in its dispatcher and std's ABI validation of the typed order and
-fulfillment arguments. Its controller, which embeds the zone's initcode (751
-bytes larger) and decodes the same arguments, grows by 1,532. Zone
-creation costs 151,677 more gas and removing a channel 80 more; conduit
-creation costs 9,860 less, fulfillment 127, cancellation 30 and validation 13
-less. The table's other calls are unchanged.
+Against Fe 22b156fff at `-Os` (Seaport 21,513 bytes, 78,342 in total),
+Seaport and Consideration grow by 183 bytes, while TransferHelper shrinks by
+178, SeaportRouter by 78, PausableZone by 510 and PausableZoneController,
+which embeds the zone's initcode, by 1,069. The difference comes from
+Sonatina's inliner, which now charges a callee's growth net of the call it
+removes ([fe-lang/sonatina#503](https://github.com/fe-lang/sonatina/pull/503)).
+Zone creation costs 102,344 less gas, getOrderStatus 50 less, fulfillment 22
+less, and the zone controller's assignOperator and pause 9 less each. The
+table's other `-Os` calls are unchanged.
 
 Compiler changes behind these numbers, all on Fe master:
 - Messages and custom errors encode into one buffer, and bools as one word
@@ -225,12 +224,12 @@ starts from a fresh chain. Set `SEAPORT_TRACE_HASHES=1` to count the exact
 transfer, cancellation and acceptance. The test compares full event bytes
 and checks that each event precedes its corresponding storage write.
 
-Fe master 22b156fff builds all eight production contracts at `-Os` and
-`-O1`, and their ABIs are unchanged from the e8612c21d build. The `-Os` build
+Fe master 5cebf09af builds all eight production contracts at `-Os` and
+`-O1`, and their ABIs are unchanged from the 22b156fff build. The `-Os` build
 passes all 27 Fe tests, all 482 Foundry tests (1,000 cases per fuzz test), the
 full Hardhat suite (402 passing, one pending) and `scripts/compare_abi.py`.
-The rooted-storage differential passes for pinned Solidity, the e8612c21d
-`-Os` build and both levels, in transient and forced persistent guard modes,
+The `-O1` build also passes all 482 Foundry tests. The rooted-storage
+differential passes for pinned Solidity and both levels, in transient and forced persistent guard modes,
 including exact storage slots, event bytes, map hashes, and log/write
 ordering. `tests/router-diff.cjs` compares 5,039 router calls with the solc
 router and finds only the four documented `Panic(0x41)` differences; with
