@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // FulfillmentApplier: aggregate fulfillment components into executions.
-use std::evm::{Address, Ctx, Panic, PANIC_OVERFLOW, revert_error}
-use std::evm::keccak_words
-use super::arr::Arr
+#![arithmetic(unchecked)]
+use std::evm::{Address, Ctx, Panic, PANIC_OVERFLOW}
+use super::raw_abi::{error_selector, revert_with0, revert_with1}
 use super::errors::{
     InvalidFulfillmentComponentData,
     MismatchedFulfillmentOfferAndConsiderationComponents,
@@ -10,7 +10,7 @@ use super::errors::{
     MissingItemAmount,
     OfferAndConsiderationRequiredOnFulfillment,
 }
-use super::model::{Book, Component, Group, Groups, Item, OrderState}
+use super::model::{Book, Group, Groups, element}
 use super::types::OFFER
 
 /// An `Execution`: a `ReceivedItem` plus the source and conduit key.
@@ -41,89 +41,61 @@ pub fn empty_execution() -> ExecutionState {
 fn raise_aggregation_errors(_ error_buffer: u256) {
     if error_buffer != 0 {
         if error_buffer == 1 {
-            revert_error(MissingItemAmount {})
+            revert_with0(error_selector<MissingItemAmount>())
         }
-        revert_error(Panic::from(PANIC_OVERFLOW))
+        revert_with1(error_selector<Panic>(), PANIC_OVERFLOW)
     }
 }
 
-/// `_aggregateValidFulfillmentOfferItems`: sum the referenced offer items of
-/// available orders, zeroing them. All of them must share type, token,
-/// identifier, offerer and conduit key. Also returns the index of the first
-/// used component, which seaport-core moves to the front of the array.
-pub fn aggregate_offer_items(_ book: Book, groups: Groups, group: Group, recipient: Address) -> (
-    ExecutionState,
-    u256,
-) {
-    let mut execution = empty_execution()
-    let mut first_used: u256 = 0
-    let mut amount: u256 = 0
-    let mut error_buffer: u256 = 0
-    let mut data_hash: u256 = 0
-    let mut k: u256 = 0
-    while k < group.len {
-        let component = *groups.components.at(group.start + k)
-        if component.order_index >= book.orders.len() {
-            revert_error(InvalidFulfillmentComponentData {})
-        }
-        let order = book.order(component.order_index)
-        if component.item_index < order.offer_len && order.numerator != 0 {
-            let item = book.offer_item(order, component.item_index)
-            let new_amount = amount.wrapping_add(item.amount)
-            if new_amount < amount {
-                error_buffer = error_buffer | 2
-            }
-            if item.amount == 0 {
-                error_buffer = error_buffer | 1
-            }
-            amount = new_amount
-            item.amount = 0
-            if data_hash == 0 {
-                execution.item_type = item.item_type
-                execution.token = item.token
-                execution.identifier = item.identifier
-                execution.recipient = recipient
-                execution.offerer = order.offerer
-                execution.conduit_key = order.conduit_key
-                data_hash = keccak_words([item.item_type, item.token.inner, item.identifier])
-                first_used = k
-            } else if order.offerer != execution.offerer
-                || order.conduit_key != execution.conduit_key
-                || data_hash != keccak_words([item.item_type, item.token.inner, item.identifier]) {
-                revert_error(InvalidFulfillmentComponentData {})
-            }
-        }
-        k += 1
-    }
-    execution.amount = amount
-    raise_aggregation_errors(error_buffer)
-    (execution, first_used)
-}
-
-/// `_aggregateValidFulfillmentConsiderationItems`: like the offer side, but
-/// items must also share the recipient; offerer and conduit key are given.
-pub fn aggregate_consideration_items(
-    _ book: Book,
-    groups: Groups,
+/// `_aggregateValidFulfillmentOfferItems` or, for `consideration`,
+/// `_aggregateValidFulfillmentConsiderationItems`: sum the referenced items of
+/// available orders into `execution`, zeroing them. All of them must share
+/// type, token and identifier, offer items also offerer and conduit key, and
+/// consideration items also the recipient; the other execution fields are
+/// given. Comparing these fields is equivalent to comparing seaport-core's
+/// hashes of them. Returns the index of the first used component, which
+/// seaport-core moves to the front of the array.
+///
+/// Each item is compared with the first used one in the pool, whose compared
+/// fields aggregation leaves unchanged, and the execution is written once at
+/// the end, so the loop keeps few values live.
+pub fn aggregate_items(
+    _ book: mut Book,
+    execution: mut ExecutionState,
     group: Group,
+    consideration: bool,
     offerer: Address,
     conduit_key: u256,
-) -> (ExecutionState, u256) {
-    let mut execution = empty_execution()
-    let mut first_used: u256 = 0
-    let mut amount: u256 = 0
-    let mut error_buffer: u256 = 0
-    let mut data_hash: u256 = 0
-    let mut k: u256 = 0
-    while k < group.len {
-        let component = *groups.components.at(group.start + k)
-        if component.order_index >= book.orders.len() {
-            revert_error(InvalidFulfillmentComponentData {})
+    recipient: Address,
+) -> u256 {
+    var found = false
+    var first_used: u256 = 0
+    var first_order: u256 = 0
+    var first_at: u256 = 0
+    var amount: u256 = 0
+    var error_buffer: u256 = 0
+    var k: u256 = 0
+    while k < group.len() {
+        let component = group.component(k)
+        if component.order_index >= book.orders.len() as u256 {
+            revert_with0(error_selector<InvalidFulfillmentComponentData>())
         }
-        let order = book.order(component.order_index)
-        if component.item_index < order.consideration_len && order.numerator != 0 {
-            let item = book.consideration_item(order, component.item_index)
-            let new_amount = amount.wrapping_add(item.amount)
+        // The order index was checked above.
+        let order = unsafe {
+            ref *element(book.orders.ptr(), component.order_index)
+        }
+        let (start, len) = if consideration {
+            (order.consideration_start, order.consideration_len)
+        } else {
+            (order.offer_start, order.offer_len)
+        }
+        if component.item_index < len && order.numerator != 0 {
+            // The item index lies in the order's range of the pool.
+            let at = start + component.item_index
+            let item = unsafe {
+                mut *element(book.items.ptr(), at)
+            }
+            let new_amount = amount + item.amount
             if new_amount < amount {
                 error_buffer = error_buffer | 2
             }
@@ -132,104 +104,176 @@ pub fn aggregate_consideration_items(
             }
             amount = new_amount
             item.amount = 0
-            let item_hash = keccak_words(
-                [item.item_type, item.token.inner, item.identifier, 0, item.receiver.inner],
-            )
-            if data_hash == 0 {
-                execution.item_type = item.item_type
-                execution.token = item.token
-                execution.identifier = item.identifier
-                execution.recipient = item.receiver
-                execution.offerer = offerer
-                execution.conduit_key = conduit_key
-                data_hash = item_hash
+            if !found {
+                found = true
                 first_used = k
-            } else if data_hash != item_hash {
-                revert_error(InvalidFulfillmentComponentData {})
+                first_order = component.order_index
+                first_at = at
+            } else {
+                // Both indexes were checked when the first item was used.
+                let first = unsafe {
+                    ref *element(book.items.ptr(), first_at)
+                }
+                let first_source = unsafe {
+                    ref *element(book.orders.ptr(), first_order)
+                }
+                let differs = if consideration {
+                    item.receiver != first.receiver
+                } else {
+                    order.offerer != first_source.offerer
+                        || order.conduit_key != first_source.conduit_key
+                }
+                if differs
+                    || item.item_type != first.item_type
+                    || item.token != first.token
+                    || item.identifier != first.identifier {
+                    revert_with0(error_selector<InvalidFulfillmentComponentData>())
+                }
             }
         }
         k += 1
     }
-    execution.amount = amount
+    execution = if found {
+        // Both indexes were checked when the first item was used.
+        let first = unsafe {
+            ref *element(book.items.ptr(), first_at)
+        }
+        let first_source = unsafe {
+            ref *element(book.orders.ptr(), first_order)
+        }
+        ExecutionState {
+            item_type: first.item_type,
+            token: first.token,
+            identifier: first.identifier,
+            amount,
+            recipient: if consideration {
+                first.receiver
+            } else {
+                recipient
+            },
+            offerer: if consideration {
+                offerer
+            } else {
+                first_source.offerer
+            },
+            conduit_key: if consideration {
+                conduit_key
+            } else {
+                first_source.conduit_key
+            },
+        }
+    } else {
+        empty_execution()
+    }
     raise_aggregation_errors(error_buffer)
-    (execution, first_used)
+    first_used
 }
 
 /// `_applyFulfillment`: match aggregated offer items against aggregated
 /// consideration items; the unmatched rest stays on the first used
 /// component.
-pub fn apply_fulfillment(_ book: Book, groups: Groups, fulfillment_index: u256) -> ExecutionState {
-    let offer_group = *groups.list.at(2 * fulfillment_index)
-    let consideration_group = *groups.list.at(2 * fulfillment_index + 1)
-    if offer_group.len == 0 || consideration_group.len == 0 {
-        revert_error(OfferAndConsiderationRequiredOnFulfillment {})
-    }
-    let (consideration, consideration_first) = aggregate_consideration_items(
-        book,
-        groups,
-        group: consideration_group,
-        offerer: Address::zero(),
-        conduit_key: 0,
-    )
-    if consideration.amount == 0 {
-        return consideration
-    }
-    let (offered, offer_first) = aggregate_offer_items(
-        book,
-        groups,
-        group: offer_group,
-        recipient: consideration.recipient,
-    )
-    let mut execution = offered
-    if execution.item_type != consideration.item_type
-        || execution.token != consideration.token
-        || execution.identifier != consideration.identifier {
-        revert_error(
-            MismatchedFulfillmentOfferAndConsiderationComponents {
-                fulfillmentIndex: fulfillment_index,
-            },
+pub fn apply_fulfillment(
+    _ book: mut Book,
+    execution: mut ExecutionState,
+    groups: Groups,
+    fulfillment_index: u256,
+) {
+    let offer_group = groups.group(2 * fulfillment_index)
+    let consideration_group = groups.group(2 * fulfillment_index + 1)
+    if offer_group.len() == 0 || consideration_group.len() == 0 {
+        revert_with0(
+            error_selector<OfferAndConsiderationRequiredOnFulfillment>(),
         )
     }
-    if consideration.amount > execution.amount {
-        let target = *groups.components.at(consideration_group.start + consideration_first)
-        let order = book.order(target.order_index)
-        let item = book.consideration_item(order, target.item_index)
-        item.amount = consideration.amount - execution.amount
-    } else {
-        let target = *groups.components.at(offer_group.start + offer_first)
-        let order = book.order(target.order_index)
-        let item = book.offer_item(order, target.item_index)
-        item.amount = execution.amount - consideration.amount
-        execution.amount = consideration.amount
+    let consideration_first = aggregate_items(
+        mut book,
+        execution: mut execution,
+        group: consideration_group,
+        consideration: true,
+        offerer: Address::zero(),
+        conduit_key: 0,
+        recipient: Address::zero(),
+    )
+    let consideration_amount = execution.amount
+    if consideration_amount == 0 {
+        return
     }
-    execution
+    // The offer aggregation replaces the consideration execution; keep the
+    // fields compared below.
+    let consideration_type = execution.item_type
+    let consideration_token = execution.token
+    let consideration_identifier = execution.identifier
+    let consideration_recipient = execution.recipient
+    let offer_first = aggregate_items(
+        mut book,
+        execution: mut execution,
+        group: offer_group,
+        consideration: false,
+        offerer: Address::zero(),
+        conduit_key: 0,
+        recipient: consideration_recipient,
+    )
+    if execution.item_type != consideration_type
+        || execution.token != consideration_token
+        || execution.identifier != consideration_identifier {
+        revert_with1(
+            error_selector<MismatchedFulfillmentOfferAndConsiderationComponents>(),
+            fulfillment_index,
+        )
+    }
+    // The unmatched rest stays on the first used item of the larger side.
+    let consideration_left = consideration_amount > execution.amount
+    let target = if consideration_left {
+        consideration_group.component(consideration_first)
+    } else {
+        offer_group.component(offer_first)
+    }
+    // Aggregation checked both indexes of the first used component.
+    let order = unsafe {
+        ref *element(book.orders.ptr(), target.order_index)
+    }
+    let start = if consideration_left {
+        order.consideration_start
+    } else {
+        order.offer_start
+    }
+    let item = unsafe {
+        mut *element(book.items.ptr(), start + target.item_index)
+    }
+    if consideration_left {
+        item.amount = consideration_amount - execution.amount
+    } else {
+        item.amount = execution.amount - consideration_amount
+        execution.amount = consideration_amount
+    }
 }
 
 /// `_aggregateAvailable`
 pub fn aggregate_available(
-    _ book: Book,
+    _ book: mut Book,
+    execution: mut ExecutionState,
     side: u8,
     groups: Groups,
     index: u256,
     fulfiller_conduit_key: u256,
     recipient: Address,
-) -> ExecutionState
+)
 uses (ctx: Ctx)
 {
-    let group = *groups.list.at(index)
-    if group.len == 0 {
-        revert_error(MissingFulfillmentComponentOnAggregation { side })
+    let group = groups.group(index)
+    if group.len() == 0 {
+        revert_with1(
+            error_selector<MissingFulfillmentComponentOnAggregation>(),
+            side as u256,
+        )
     }
-    if side == OFFER {
-        let (execution, _) = aggregate_offer_items(book, groups, group, recipient)
-        return execution
-    }
-    let (execution, _) = aggregate_consideration_items(
-        book,
-        groups,
+    let _ = aggregate_items(
+        mut book,
+        execution: mut execution,
         group,
+        consideration: side != OFFER,
         offerer: ctx.caller(),
         conduit_key: fulfiller_conduit_key,
+        recipient,
     )
-    execution
 }

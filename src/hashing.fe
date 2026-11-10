@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // EIP-712 typehashes and derivations of ConsiderationBase and
 // GettersAndDerivers.
-use core::ptr
 use std::evm::{Address, keccak256, keccak_words, create2_address}
-use super::arr::Arr
-use super::model::{Book, Item, OrderState}
+use core::abi::store_word
+use core::ptr::{self, MemSpan}
+use super::abi_view::CalldataView
 
 /// keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
 pub const EIP712_DOMAIN_TYPEHASH: u256 = 0x8b73c3c69bb8fe3d512ecc4cf759cc79239f7b179b0ffacaa9a75d522b39400f
@@ -33,92 +33,109 @@ impl Copy for Env {}
 
 pub fn derive_domain_separator(name_hash: u256, chain_id: u256, this: Address) -> u256 {
     keccak_words(
-        [EIP712_DOMAIN_TYPEHASH, name_hash, VERSION_HASH, chain_id, this.inner],
+        [EIP712_DOMAIN_TYPEHASH, name_hash, VERSION_HASH, chain_id, this.word()],
     )
 }
 
-/// The EIP-712 hash of `order` with `counter`; only the first
-/// `total_original` consideration items are included.
-pub fn derive_order_hash(_ book: Book, order: *OrderState, counter: u256) -> u256 {
-    let offer_hash = hash_items(
-        book.items,
-        start: order.offer_start,
-        count: order.offer_len,
-        consideration: false,
-    )
+/// `_deriveOrderHash`: the EIP-712 hash of the raw `OrderParameters` words
+/// at `params` (Seaport hashes its raw calldata copy), covering the first
+/// `consideration_count` consideration items, with `counter`.
+pub fn derive_order_hash(_ params: CalldataView, consideration_count: u256, counter: u256) -> u256 {
+    let offer = params.child(64)
+    let offer_hash = hash_items(offer, count: offer.len(), consideration: false)
     let consideration_hash = hash_items(
-        book.items,
-        start: order.consideration_start,
-        count: order.total_original,
+        params.child(96),
+        count: consideration_count,
         consideration: true,
     )
-    keccak_words(
-        [
-            ORDER_TYPEHASH,
-            order.offerer.inner,
-            order.zone.inner,
-            offer_hash,
-            consideration_hash,
-            order.order_type,
-            order.start_time,
-            order.end_time,
-            order.zone_hash,
-            order.salt,
-            order.conduit_key,
-            counter,
-        ],
+    let preimage = ptr::alloc_bytes(384)
+    // The typehash, the raw offerer and zone, both item hashes, the raw order
+    // type through conduit key, and the counter fill the 384 bytes.
+    unsafe {
+        store_word(ptr: preimage, value: ORDER_TYPEHASH)
+        params.copy_to(ptr::offset_bytes(preimage, 32), len: 64)
+        store_word(ptr: ptr::offset_bytes(preimage, 96), value: offer_hash)
+        store_word(
+            ptr: ptr::offset_bytes(preimage, 128),
+            value: consideration_hash,
+        )
+        params.offset(128).copy_to(ptr::offset_bytes(preimage, 160), len: 192)
+        store_word(ptr: ptr::offset_bytes(preimage, 352), value: counter)
+        keccak256(MemSpan::from_raw_parts(ptr: preimage, len: 384))
+    }
+}
+
+/// The hash of the `OrderComponents` at `order`, whose counter replaces
+/// `totalOriginalConsiderationItems` (`_decodeOrderComponentsAsOrderParameters`).
+pub fn derive_components_hash(_ order: CalldataView) -> u256 {
+    derive_order_hash(
+        order,
+        consideration_count: order.child(96).len(),
+        counter: order.word(320),
     )
 }
 
-fn hash_items(_ items: Arr<Item>, start: u256, count: u256, consideration: bool) -> u256 {
-    let hashes = ptr::alloc_bytes(count * 32)
-    let mut i: u256 = 0
+/// The hash of the first `count` raw items of the offer (or consideration)
+/// array at `items`. Each item is hashed from frame scratch; only the item
+/// hashes take heap memory.
+#[arithmetic(unchecked)]
+#[inline(always)]
+fn hash_items(_ items: CalldataView, count: u256, consideration: bool) -> u256 {
+    let hashes = ptr::alloc_bytes((count * 32).downcast_unchecked())
+    var i: u256 = 0
     while i < count {
-        let item = items.at(start + i)
         let hash = if consideration {
+            let item = items.element(index: i, stride: 192)
             keccak_words(
                 [
                     CONSIDERATION_ITEM_TYPEHASH,
-                    item.item_type,
-                    item.token.inner,
-                    item.identifier,
-                    item.start_amount,
-                    item.end_amount,
-                    item.recipient.inner,
+                    item.word(0),
+                    item.word(32),
+                    item.word(64),
+                    item.word(96),
+                    item.word(128),
+                    item.word(160),
                 ],
             )
         } else {
+            let item = items.element(index: i, stride: 160)
             keccak_words(
                 [
                     OFFER_ITEM_TYPEHASH,
-                    item.item_type,
-                    item.token.inner,
-                    item.identifier,
-                    item.start_amount,
-                    item.end_amount,
+                    item.word(0),
+                    item.word(32),
+                    item.word(64),
+                    item.word(96),
+                    item.word(128),
                 ],
             )
         }
-        store(ptr::offset_bytes(hashes, i * 32), hash)
+        // Hash `i` of the `count` allocated above.
+        unsafe {
+            store_word(
+                ptr: ptr::offset_bytes(hashes, (i * 32).downcast_unchecked()),
+                value: hash,
+            )
+        }
         i += 1
     }
     keccak256(
-        core::ptr::MemSpan::from_raw_parts(ptr: hashes, len: count * 32),
+        unsafe {
+            MemSpan::from_raw_parts(ptr: hashes, len: (count * 32).downcast_unchecked())
+        },
     )
-}
-
-fn store(_ at: *u8, _ value: u256) {
-    let word = ptr::cast<u8, u256>(at)
-    *word = value
 }
 
 /// keccak256(0x1901 ++ domainSeparator ++ orderHash)
 pub fn derive_eip712_digest(domain_separator: u256, order_hash: u256) -> u256 {
     let buf = ptr::alloc_bytes(96)
-    store(buf, 0x1901 << 240)
-    store(ptr::offset_bytes(buf, 2), domain_separator)
-    store(ptr::offset_bytes(buf, 34), order_hash)
-    keccak256(core::ptr::MemSpan::from_raw_parts(ptr: buf, len: 66))
+    // The three overlapping words lie in the 96 bytes allocated above.
+    unsafe {
+        store_word(ptr: buf, value: 0x1901 << 240)
+        store_word(ptr: ptr::offset_bytes(buf, 2), value: domain_separator)
+        store_word(ptr: ptr::offset_bytes(buf, 34), value: order_hash)
+        keccak256(MemSpan::from_raw_parts(ptr: buf, len: 66))
+    }
 }
 
 /// CREATE2 address of the conduit for `conduit_key`.
@@ -130,32 +147,37 @@ pub fn derive_conduit(_ env: Env, conduit_key: u256) -> Address {
     )
 }
 
-/// `BulkOrder` typehash for a Merkle tree of `height` (1 through 24).
+const BULK_ORDER_TYPEHASHES: [u256; 24] = [
+    0x3ca2711d29384747a8f61d60aad3c450405f7aaff5613541dee28df2d6986d32,
+    0xbf8e29b89f29ed9b529c154a63038ffca562f8d7cd1e2545dda53a1b582dde30,
+    0x53c6f6856e13104584dd0797ca2b2779202dc2597c6066a42e0d8fe990b0024d,
+    0xa02eb7ff164c884e5e2c336dc85f81c6a93329d8e9adf214b32729b894de2af1,
+    0x39c9d33c18e050dda0aeb9a8086fb16fc12d5d64536780e1da7405a800b0b9f6,
+    0x1c19f71958cdd8f081b4c31f7caf5c010b29d12950be2fa1c95070dc47e30b55,
+    0xca74fab2fece9a1d58234a274220ad05ca096a92ef6a1ca1750b9d90c948955c,
+    0x7ff98d9d4e55d876c5cfac10b43c04039522f3ddfb0ea9bfe70c68cfb5c7cc14,
+    0xbed7be92d41c56f9e59ac7a6272185299b815ddfabc3f25deb51fe55fe2f9e8a,
+    0xd1d97d1ef5eaa37a4ee5fbf234e6f6d64eb511eb562221cd7edfbdde0848da05,
+    0x896c3f349c4da741c19b37fec49ed2e44d738e775a21d9c9860a69d67a3dae53,
+    0xbb98d87cc12922b83759626c5f07d72266da9702d19ffad6a514c73a89002f5f,
+    0xe6ae19322608dd1f8a8d56aab48ed9c28be489b689f4b6c91268563efc85f20e,
+    0x6b5b04cbae4fcb1a9d78e7b2dfc51a36933d023cf6e347e03d517b472a852590,
+    0xd1eb68309202b7106b891e109739dbbd334a1817fe5d6202c939e75cf5e35ca9,
+    0x1da3eed3ecef6ebaa6e5023c057ec2c75150693fd0dac5c90f4a142f9879fde8,
+    0xeee9a1392aa395c7002308119a58f2582777a75e54e0c1d5d5437bd2e8bf6222,
+    0xc3939feff011e53ab8c35ca3370aad54c5df1fc2938cd62543174fa6e7d85877,
+    0x0efca7572ac20f5ae84db0e2940674f7eca0a4726fa1060ffc2d18cef54b203d,
+    0x5a4f867d3d458dabecad65f6201ceeaba0096df2d0c491cc32e6ea4e64350017,
+    0x80987079d291feebf21c2230e69add0f283cee0b8be492ca8050b4185a2ff719,
+    0x3bd8cff538aba49a9c374c806d277181e9651624b3e31111bc0624574f8bca1d,
+    0x5d6a3f098a0bc373f808c619b1bb4028208721b3c4f8d6bc8a874d659814eb76,
+    0x1d51df90cba8de7637ca3e8fe1e3511d1dc2f23487d05dbdecb781860c21ac1c,
+]
+
+/// `BulkOrder` typehash for heights 1 through 24. Other inputs retain the
+/// height-24 fallback used by the original match.
 pub fn bulk_order_typehash(_ height: u256) -> u256 {
-    match height {
-        1 => 0x3ca2711d29384747a8f61d60aad3c450405f7aaff5613541dee28df2d6986d32,
-        2 => 0xbf8e29b89f29ed9b529c154a63038ffca562f8d7cd1e2545dda53a1b582dde30,
-        3 => 0x53c6f6856e13104584dd0797ca2b2779202dc2597c6066a42e0d8fe990b0024d,
-        4 => 0xa02eb7ff164c884e5e2c336dc85f81c6a93329d8e9adf214b32729b894de2af1,
-        5 => 0x39c9d33c18e050dda0aeb9a8086fb16fc12d5d64536780e1da7405a800b0b9f6,
-        6 => 0x1c19f71958cdd8f081b4c31f7caf5c010b29d12950be2fa1c95070dc47e30b55,
-        7 => 0xca74fab2fece9a1d58234a274220ad05ca096a92ef6a1ca1750b9d90c948955c,
-        8 => 0x7ff98d9d4e55d876c5cfac10b43c04039522f3ddfb0ea9bfe70c68cfb5c7cc14,
-        9 => 0xbed7be92d41c56f9e59ac7a6272185299b815ddfabc3f25deb51fe55fe2f9e8a,
-        10 => 0xd1d97d1ef5eaa37a4ee5fbf234e6f6d64eb511eb562221cd7edfbdde0848da05,
-        11 => 0x896c3f349c4da741c19b37fec49ed2e44d738e775a21d9c9860a69d67a3dae53,
-        12 => 0xbb98d87cc12922b83759626c5f07d72266da9702d19ffad6a514c73a89002f5f,
-        13 => 0xe6ae19322608dd1f8a8d56aab48ed9c28be489b689f4b6c91268563efc85f20e,
-        14 => 0x6b5b04cbae4fcb1a9d78e7b2dfc51a36933d023cf6e347e03d517b472a852590,
-        15 => 0xd1eb68309202b7106b891e109739dbbd334a1817fe5d6202c939e75cf5e35ca9,
-        16 => 0x1da3eed3ecef6ebaa6e5023c057ec2c75150693fd0dac5c90f4a142f9879fde8,
-        17 => 0xeee9a1392aa395c7002308119a58f2582777a75e54e0c1d5d5437bd2e8bf6222,
-        18 => 0xc3939feff011e53ab8c35ca3370aad54c5df1fc2938cd62543174fa6e7d85877,
-        19 => 0x0efca7572ac20f5ae84db0e2940674f7eca0a4726fa1060ffc2d18cef54b203d,
-        20 => 0x5a4f867d3d458dabecad65f6201ceeaba0096df2d0c491cc32e6ea4e64350017,
-        21 => 0x80987079d291feebf21c2230e69add0f283cee0b8be492ca8050b4185a2ff719,
-        22 => 0x3bd8cff538aba49a9c374c806d277181e9651624b3e31111bc0624574f8bca1d,
-        23 => 0x5d6a3f098a0bc373f808c619b1bb4028208721b3c4f8d6bc8a874d659814eb76,
-        _ => 0x1d51df90cba8de7637ca3e8fe1e3511d1dc2f23487d05dbdecb781860c21ac1c,
-    }
+    let index = height.wrapping_sub(1)
+    let bounded = if index < 23 { index } else { 23 }
+    BULK_ORDER_TYPEHASHES[bounded.downcast_unchecked()]
 }

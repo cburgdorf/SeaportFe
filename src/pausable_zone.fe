@@ -5,7 +5,7 @@
 // `isPaused` into slot 0; the controller keeps `_owner`, `_potentialOwner`
 // and `_pauser` in slots 0 to 2.
 use core::ptr::MemBuffer
-use std::abi::{Bytes, Bytes4, Bytes32, DynArray, DynString, sol}
+use std::abi::{Bytes, Bytes4, Bytes32, DynArray, DynString, dyn_array_from, sol}
 use std::evm::{
     Address,
     Call,
@@ -14,21 +14,16 @@ use std::evm::{
     Ctx,
     Log,
     RawOps,
+    Wei,
     create2_address,
     keccak256,
-    revert_error,
+    revert_empty,
 }
-use super::lowlevel::store_word
+use super::raw_abi::{error_selector, revert_with0, revert_with1}
+use super::abi_view::CalldataView
+use super::buffer::Buffer
 use super::seaport::SeaportMsg
-use super::types::{
-    AdvancedOrder,
-    CriteriaResolver,
-    Execution,
-    Fulfillment,
-    Order,
-    OrderComponents,
-    ZoneParameters,
-}
+use super::types::{AdvancedOrder, CriteriaResolver, Execution, Fulfillment, Order, OrderComponents}
 
 #[event]
 pub struct Paused {}
@@ -100,14 +95,6 @@ pub msg PausableZoneMsg {
         criteriaResolvers: DynArray<CriteriaResolver>,
         fulfillments: DynArray<Fulfillment>,
     } -> DynArray<Execution>,
-    #[selector = sol(
-        "authorizeOrder((bytes32,address,address,(uint8,address,uint256,uint256)[],(uint8,address,uint256,uint256,address)[],bytes,bytes32[],uint256,uint256,bytes32))",
-    )]
-    AuthorizeOrder { zoneParameters: ZoneParameters } -> Bytes4,
-    #[selector = sol(
-        "validateOrder((bytes32,address,address,(uint8,address,uint256,uint256)[],(uint8,address,uint256,uint256,address)[],bytes,bytes32[],uint256,uint256,bytes32))",
-    )]
-    ValidateOrder { zoneParameters: ZoneParameters } -> Bytes4,
     #[selector = sol("getSeaportMetadata()")]
     GetSeaportMetadata {} -> (DynString, DynArray<Schema>),
     #[selector = sol("supportsInterface(bytes4)")]
@@ -118,36 +105,85 @@ pub msg PausableZoneMsg {
     IsPaused {} -> bool,
 }
 
+/// The zone interface, whose `ZoneParameters` argument the zone never reads.
+/// As in Solidity, only the argument head is checked.
+msg PausableZoneCalldataMsg {
+    // authorizeOrder((bytes32,address,address,(uint8,address,uint256,uint256)[],(uint8,address,uint256,uint256,address)[],bytes,bytes32[],uint256,uint256,bytes32))
+    #[selector = 0x01e4d72a]
+    AuthorizeOrder {} -> Bytes4,
+    // validateOrder((bytes32,address,address,(uint8,address,uint256,uint256)[],(uint8,address,uint256,uint256,address)[],bytes,bytes32[],uint256,uint256,bytes32))
+    #[selector = 0x17b1f942]
+    ValidateOrder {} -> Bytes4,
+}
+
+/// Solidity's checks of a `ZoneParameters calldata` argument: its offset and
+/// its 320-byte head lie in the calldata.
+fn check_zone_parameters_argument() {
+    let _ = CalldataView::arguments(32).struct_argument(offset: 0, size: 0x140)
+}
+
 const OPERATOR_MASK: u256 = 0xffffffffffffffffffffffffffffffffffffffff
 
-fn zone_operator() -> Address uses (ops: RawOps) {
-    Address { inner: ops.sload(0) & OPERATOR_MASK }
+fn zone_operator(_ zone_state: u256) -> Address {
+    Address::from_word_truncate(zone_state)
 }
 
-fn zone_is_paused() -> bool uses (ops: RawOps) {
-    (ops.sload(0) >> 160) & 0xff != 0
+fn zone_is_paused(_ zone_state: u256) -> bool {
+    (zone_state >> 160) & 0xff != 0
 }
 
-fn assert_operator(_ controller: Address) uses (ctx: Ctx, ops: RawOps) {
-    if ctx.caller() != zone_operator() && ctx.caller() != controller {
-        revert_error(InvalidOperator {})
+fn assert_operator(_ controller: Address, zone_state: u256) uses (ctx: Ctx) {
+    if ctx.caller() != zone_operator(zone_state) && ctx.caller() != controller {
+        revert_with0(error_selector<InvalidOperator>())
     }
 }
 
-fn assert_not_paused() uses (ops: RawOps) {
-    if zone_is_paused() {
-        revert_error(ZoneIsPaused {})
+fn assert_not_paused(_ zone_state: u256) {
+    if zone_is_paused(zone_state) {
+        revert_with0(error_selector<ZoneIsPaused>())
     }
+}
+
+/// `[Schema { id: 3003, metadata: "" }]`: the length, the element offset,
+/// the id, the metadata offset and the empty metadata.
+#[inline(always)]
+fn metadata_schemas() -> DynArray<Schema> {
+    var schemas = Buffer::new(0xa0)
+    unsafe {
+        schemas.put(offset: 0, value: 1)
+        schemas.put(offset: 0x20, value: 0x20)
+        schemas.put(offset: 0x40, value: 3003)
+        schemas.put(offset: 0x60, value: 0x40)
+        schemas.into_dyn_array_unvalidated(len: 1)
+    }
+}
+
+#[test]
+fn metadata_schemas_match_the_typed_encoding() {
+    let schemas = metadata_schemas()
+    let expected = dyn_array_from([Schema { id: 3003, metadata: Bytes::empty() }])
+    assert(schemas.encoded_size() == expected.encoded_size())
+    let actual = schemas.encoded_span()
+    let typed = expected.encoded_span()
+    var i: usize = 0
+    while i < actual.len() {
+        assert(actual.byte_at(i) == typed.byte_at(i))
+        i += 1
+    }
+    let schema = schemas.get(0)
+    assert(schema.id == 3003 && schema.metadata.len() == 0)
 }
 
 fn assert_controller(_ controller: Address) uses (ctx: Ctx) {
     if ctx.caller() != controller {
-        revert_error(InvalidController {})
+        revert_with0(error_selector<InvalidController>())
     }
 }
 
 pub contract PausableZone {
     controller: Address,
+    #[slot(0)]
+    mut zone_state: u256,
 
     init()
     uses (mut controller, ctx: Ctx, log: mut Log)
@@ -161,38 +197,35 @@ pub contract PausableZone {
             controller,
             ctx: Ctx,
             call: mut Call,
-            ops: RawOps,
+            zone_state,
         ) {
-            assert_operator(controller)
+            assert_operator(controller, zone_state)
             seaport.call(SeaportMsg::Cancel { orders })
         }
-        Pause {} uses (controller, ctx: Ctx, ops: mut RawOps, log: mut Log) {
+        Pause {} uses (controller, ctx: Ctx, mut zone_state, log: mut Log) {
             assert_controller(controller)
             log.emit(Paused {})
-            ops.sstore(slot: 0, value: ops.sload(0) | (1 << 160))
+            zone_state |= 1 << 160
         }
         AssignOperator { operatorToAssign } uses (
             controller,
             ctx: Ctx,
-            ops: mut RawOps,
+            mut zone_state,
             log: mut Log,
         ) {
             assert_controller(controller)
-            if operatorToAssign.inner == 0 {
-                revert_error(PauserCanNotBeSetAsZero {})
+            if operatorToAssign.word() == 0 {
+                revert_with0(error_selector<PauserCanNotBeSetAsZero>())
             }
-            ops.sstore(
-                slot: 0,
-                value: (ops.sload(0) & !OPERATOR_MASK) | operatorToAssign.inner,
-            )
+            zone_state = (zone_state & !OPERATOR_MASK) | operatorToAssign.word()
             log.emit(OperatorUpdated { newOperator: operatorToAssign })
         }
         #[payable]
         ExecuteMatchOrders { seaport, orders, fulfillments } -> DynArray<Execution>
-        uses (controller, ctx: Ctx, call: mut Call, ops: RawOps)
+        uses (controller, ctx: Ctx, call: mut Call, zone_state)
         {
-            assert_operator(controller)
-            assert_not_paused()
+            assert_operator(controller, zone_state)
+            assert_not_paused(zone_state)
             call.call(
                 addr: seaport,
                 gas: ctx.gas(),
@@ -204,10 +237,10 @@ pub contract PausableZone {
         ExecuteMatchAdvancedOrders { seaport, orders, criteriaResolvers, fulfillments } -> DynArray<
             Execution,
         >
-        uses (controller, ctx: Ctx, call: mut Call, ops: RawOps)
+        uses (controller, ctx: Ctx, call: mut Call, zone_state)
         {
-            assert_operator(controller)
-            assert_not_paused()
+            assert_operator(controller, zone_state)
+            assert_not_paused(zone_state)
             call.call(
                 addr: seaport,
                 gas: ctx.gas(),
@@ -220,38 +253,32 @@ pub contract PausableZone {
                 },
             )
         }
-        AuthorizeOrder { zoneParameters } -> Bytes4
-        uses (ops: RawOps)
-        {
-            assert_not_paused()
-            Bytes4 { val: AUTHORIZE_ORDER_SELECTOR }
-        }
-        ValidateOrder { zoneParameters } -> Bytes4
-        uses (ops: RawOps)
-        {
-            assert_not_paused()
-            Bytes4 { val: VALIDATE_ORDER_SELECTOR }
-        }
         GetSeaportMetadata {} -> (DynString, DynArray<Schema>) {
             // "PausableZone"
             let name = DynString::from_word_prefix(word: 0x5061757361626c655a6f6e65 << 160, len: 12)
-            // [Schema({ id: 3003, metadata: "" })]
-            let data = core::ptr::alloc_bytes(160)
-            store_word(data, 1)
-            store_word(core::ptr::offset_bytes(data, 32), 0x20)
-            store_word(core::ptr::offset_bytes(data, 64), 3003)
-            store_word(core::ptr::offset_bytes(data, 96), 0x40)
-            store_word(core::ptr::offset_bytes(data, 128), 0)
-            (name, DynArray<Schema>::from_abi_tail(data, len: 1, size: 160))
+            (name, metadata_schemas())
         }
         SupportsInterface { interfaceId } -> bool {
             interfaceId.val == ZONE_INTERFACE_ID || interfaceId.val == ERC165_INTERFACE_ID
         }
-        Operator {} -> Address uses (ops: RawOps) {
-            zone_operator()
+        Operator {} -> Address uses (zone_state) {
+            zone_operator(zone_state)
         }
-        IsPaused {} -> bool uses (ops: RawOps) {
-            zone_is_paused()
+        IsPaused {} -> bool uses (zone_state) {
+            zone_is_paused(zone_state)
+        }
+    }
+
+    recv PausableZoneCalldataMsg {
+        AuthorizeOrder {} -> Bytes4 uses (zone_state) {
+            check_zone_parameters_argument()
+            assert_not_paused(zone_state)
+            Bytes4 { val: AUTHORIZE_ORDER_SELECTOR }
+        }
+        ValidateOrder {} -> Bytes4 uses (zone_state) {
+            check_zone_parameters_argument()
+            assert_not_paused(zone_state)
+            Bytes4 { val: VALIDATE_ORDER_SELECTOR }
         }
     }
 }
@@ -308,23 +335,23 @@ pub msg PausableZoneControllerMsg {
     ZoneCreationCode {} -> Bytes32,
 }
 
-const OWNER_SLOT: u256 = 0
-const POTENTIAL_OWNER_SLOT: u256 = 1
-const PAUSER_SLOT: u256 = 2
-
-fn read_address(_ slot: u256) -> Address uses (ops: RawOps) {
-    Address { inner: ops.sload(slot) }
+/// Revert without data unless `zone` has code, as Solidity checks before
+/// a call whose result it does not decode.
+fn assert_has_code(_ zone: Address) uses (ctx: Ctx) {
+    if ctx.extcodesize(zone) == 0 {
+        revert_empty()
+    }
 }
 
-fn assert_owner() uses (ctx: Ctx, ops: RawOps) {
-    if ctx.caller() != read_address(OWNER_SLOT) {
-        revert_error(CallerIsNotOwner {})
+fn assert_owner(_ owner: u256) uses (ctx: Ctx) {
+    if ctx.caller().word() != owner {
+        revert_with0(error_selector<CallerIsNotOwner>())
     }
 }
 
 fn zone_init_code_hash() -> u256 uses (ops: mut RawOps) {
     let len = <PausableZone as Contract>::init_code_len()
-    let mut code = MemBuffer::with_capacity(len)
+    var code = MemBuffer::with_capacity(len.downcast_unchecked())
     ops.codecopy(
         dest: mut code,
         dest_offset: 0,
@@ -336,11 +363,17 @@ fn zone_init_code_hash() -> u256 uses (ops: mut RawOps) {
 
 pub contract PausableZoneController {
     zone_creation_code: u256,
+    #[slot(0)]
+    mut owner: u256,
+    #[slot(1)]
+    mut potential_owner: u256,
+    #[slot(2)]
+    mut pauser: u256,
 
     init(ownerAddress: Address)
-    uses (mut zone_creation_code, ops: mut RawOps)
+    uses (mut zone_creation_code, mut owner, ops: mut RawOps)
     {
-        ops.sstore(slot: OWNER_SLOT, value: ownerAddress.inner)
+        owner = ownerAddress.word()
         zone_creation_code = zone_init_code_hash()
     }
 
@@ -349,34 +382,34 @@ pub contract PausableZoneController {
             zone_creation_code,
             ctx: Ctx,
             create: mut Create,
-            ops: RawOps,
+            owner,
             log: mut Log,
         ) {
-            assert_owner()
+            assert_owner(owner)
             let derived = create2_address(
                 deployer: ctx.address(),
                 salt: salt.val,
                 init_code_hash: zone_creation_code,
             )
             if ctx.extcodesize(derived) != 0 {
-                revert_error(ZoneAlreadyExists { zone: derived })
+                revert_with1(error_selector<ZoneAlreadyExists>(), derived.word())
             }
-            create.create2<PausableZone>(value: 0, args: (), salt: salt.val)
+            create.create2<PausableZone>(value: Wei::zero(), args: (), salt: salt.val)
             log.emit(ZoneCreated { zone: derived, salt })
             derived
         }
-        Pause { zone } -> bool uses (ctx: Ctx, call: mut Call, ops: RawOps) {
-            if ctx.caller() != read_address(PAUSER_SLOT)
-                && ctx.caller() != read_address(OWNER_SLOT) {
-                revert_error(InvalidPauser {})
+        Pause { zone } -> bool uses (owner, pauser, ctx: Ctx, call: mut Call) {
+            if ctx.caller().word() != pauser && ctx.caller().word() != owner {
+                revert_with0(error_selector<InvalidPauser>())
             }
+            assert_has_code(zone)
             zone.call(PausableZoneMsg::Pause {})
             true
         }
         CancelOrders { pausableZoneAddress, seaportAddress, orders }
-        uses (ctx: Ctx, call: mut Call, ops: RawOps)
+        uses (owner, ctx: Ctx, call: mut Call)
         {
-            assert_owner()
+            assert_owner(owner)
             let _: bool = pausableZoneAddress
                 .call(
                     PausableZoneMsg::CancelOrders { seaport: seaportAddress, orders },
@@ -389,9 +422,9 @@ pub contract PausableZoneController {
             orders,
             fulfillments,
         } -> DynArray<Execution>
-        uses (ctx: Ctx, call: mut Call, ops: RawOps)
+        uses (owner, ctx: Ctx, call: mut Call)
         {
-            assert_owner()
+            assert_owner(owner)
             call.call(
                 addr: pausableZoneAddress,
                 gas: ctx.gas(),
@@ -411,9 +444,9 @@ pub contract PausableZoneController {
             criteriaResolvers,
             fulfillments,
         } -> DynArray<Execution>
-        uses (ctx: Ctx, call: mut Call, ops: RawOps)
+        uses (owner, ctx: Ctx, call: mut Call)
         {
-            assert_owner()
+            assert_owner(owner)
             call.call(
                 addr: pausableZoneAddress,
                 gas: ctx.gas(),
@@ -426,59 +459,65 @@ pub contract PausableZoneController {
                 },
             )
         }
-        TransferOwnership { newPotentialOwner } uses (ctx: Ctx, ops: mut RawOps, log: mut Log) {
-            assert_owner()
-            if newPotentialOwner.inner == 0 {
-                revert_error(OwnerCanNotBeSetAsZero {})
+        TransferOwnership { newPotentialOwner } uses (
+            owner,
+            mut potential_owner,
+            ctx: Ctx,
+            log: mut Log,
+        ) {
+            assert_owner(owner)
+            if newPotentialOwner.word() == 0 {
+                revert_with0(error_selector<OwnerCanNotBeSetAsZero>())
             }
             log.emit(PotentialOwnerUpdated { newPotentialOwner })
-            ops.sstore(slot: POTENTIAL_OWNER_SLOT, value: newPotentialOwner.inner)
+            potential_owner = newPotentialOwner.word()
         }
-        CancelOwnershipTransfer {} uses (ctx: Ctx, ops: mut RawOps, log: mut Log) {
-            assert_owner()
+        CancelOwnershipTransfer {} uses (owner, mut potential_owner, ctx: Ctx, log: mut Log) {
+            assert_owner(owner)
             log.emit(
                 PotentialOwnerUpdated { newPotentialOwner: Address::zero() },
             )
-            ops.sstore(slot: POTENTIAL_OWNER_SLOT, value: 0)
+            potential_owner = 0
         }
-        AcceptOwnership {} uses (ctx: Ctx, ops: mut RawOps, log: mut Log) {
-            if ctx.caller() != read_address(POTENTIAL_OWNER_SLOT) {
-                revert_error(CallerIsNotPotentialOwner {})
+        AcceptOwnership {} uses (mut owner, mut potential_owner, ctx: Ctx, log: mut Log) {
+            if ctx.caller().word() != potential_owner {
+                revert_with0(error_selector<CallerIsNotPotentialOwner>())
             }
             log.emit(
                 PotentialOwnerUpdated { newPotentialOwner: Address::zero() },
             )
-            ops.sstore(slot: POTENTIAL_OWNER_SLOT, value: 0)
+            potential_owner = 0
             log.emit(
                 OwnershipTransferred {
-                    previousOwner: read_address(OWNER_SLOT),
+                    previousOwner: Address::from_word_truncate(owner),
                     newOwner: ctx.caller(),
                 },
             )
-            ops.sstore(slot: OWNER_SLOT, value: ctx.caller().inner)
+            owner = ctx.caller().word()
         }
-        AssignPauser { pauserToAssign } uses (ctx: Ctx, ops: mut RawOps, log: mut Log) {
-            assert_owner()
-            if pauserToAssign.inner == 0 {
-                revert_error(PauserCanNotBeSetAsZero {})
+        AssignPauser { pauserToAssign } uses (owner, mut pauser, ctx: Ctx, log: mut Log) {
+            assert_owner(owner)
+            if pauserToAssign.word() == 0 {
+                revert_with0(error_selector<PauserCanNotBeSetAsZero>())
             }
-            ops.sstore(slot: PAUSER_SLOT, value: pauserToAssign.inner)
+            pauser = pauserToAssign.word()
             log.emit(PauserUpdated { newPauser: pauserToAssign })
         }
         AssignOperator { pausableZoneAddress, operatorToAssign }
-        uses (ctx: Ctx, call: mut Call, ops: RawOps)
+        uses (owner, ctx: Ctx, call: mut Call)
         {
-            assert_owner()
+            assert_owner(owner)
+            assert_has_code(pausableZoneAddress)
             pausableZoneAddress.call(PausableZoneMsg::AssignOperator { operatorToAssign })
         }
-        Owner {} -> Address uses (ops: RawOps) {
-            read_address(OWNER_SLOT)
+        Owner {} -> Address uses (owner) {
+            Address::from_word_truncate(owner)
         }
-        PotentialOwner {} -> Address uses (ops: RawOps) {
-            read_address(POTENTIAL_OWNER_SLOT)
+        PotentialOwner {} -> Address uses (potential_owner) {
+            Address::from_word_truncate(potential_owner)
         }
-        Pauser {} -> Address uses (ops: RawOps) {
-            read_address(PAUSER_SLOT)
+        Pauser {} -> Address uses (pauser) {
+            Address::from_word_truncate(pauser)
         }
         ZoneCreationCode {} -> Bytes32 uses (zone_creation_code) {
             Bytes32 { val: zone_creation_code }

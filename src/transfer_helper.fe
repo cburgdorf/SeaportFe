@@ -2,11 +2,11 @@
 // TransferHelper (contracts/helpers/TransferHelper.sol): bulk transfers of
 // ERC20/721/1155 tokens through a conduit.
 use core::option::Option
-use core::ptr::{self, MemBuffer, MemSpan}
-use std::abi::{Bytes, Bytes4, Bytes32, DynArray, DynString, MemVec, sol}
-use std::evm::{Address, Call, CallOutcome, Ctx, RawOps, create2_address, revert_error}
-use super::conduit::{ConduitMsg, ConduitTransfer}
-use super::lowlevel::{load_word, store_word}
+use core::ptr::MemSpan
+use std::abi::{Bytes, Bytes4, Bytes32, DynArray, DynString, sol}
+use std::evm::{Address, Call, CallOutcome, Ctx, RawOps, Wei, create2_address, revert_error}
+use super::raw_abi::{error_selector, revert_with_reason2, revert_with_reason3}
+use super::buffer::{Buffer, read_word, return_word}
 
 #[abi]
 pub struct TransferHelperItem {
@@ -109,26 +109,22 @@ pub fn setup(_ controller: Address) -> TransferHelperEnv uses (call: Call) {
 }
 
 /// The message of a Solidity `Error(string)` revert, decoded like the
-/// `catch Error(string memory)` clause does; `None` when the returndata is
-/// something else.
-pub fn try_decode_error_string(_ data: MemSpan) -> Option<DynString> {
-    let size = data.len()
-    if size < 0x44 || load_word(data.ptr()) >> 224 != ERROR_STRING_SELECTOR {
+/// `catch Error(string memory)` clause does, as its offset and length in
+/// `data`; `None` when the returndata is something else.
+pub fn try_decode_error_string(_ data: MemSpan) -> Option<(u256, u256)> {
+    let size = data.len() as u256
+    if size < 0x44 || return_word(data, initial: 0) >> 224 != ERROR_STRING_SELECTOR {
         return Option::None
     }
-    let offset = load_word(ptr::offset_bytes(data.ptr(), 4))
+    let offset = read_word(data, offset: 4)
     if offset > 0xffffffffffffffff || offset + 0x24 > size {
         return Option::None
     }
-    let length = load_word(ptr::offset_bytes(data.ptr(), 4 + offset))
+    let length = read_word(data, offset: 4 + offset)
     if length > 0xffffffffffffffff || offset + 0x20 + length > size - 4 {
         return Option::None
     }
-    Option::Some(
-        DynString::from_payload(
-            source: data.slice(offset: 4 + offset + 0x20, len: length),
-        ),
-    )
+    Option::Some((4 + offset + 0x20, length))
 }
 
 /// A Solidity `returns (bytes4)` value: at least one word whose low 28 bytes
@@ -137,7 +133,7 @@ fn decode_bytes4(_ data: MemSpan) -> u256 {
     if data.len() < 32 {
         std::evm::revert(())
     }
-    let word = load_word(data.ptr())
+    let word = read_word(data, offset: 0)
     if word << 32 != 0 {
         std::evm::revert(())
     }
@@ -154,31 +150,43 @@ uses (ctx: Ctx, call: mut Call)
         tokenId: token_id,
         data: Bytes::empty(),
     }
-    let outcome = call.try_call(addr: recipient, gas: ctx.gas(), value: 0, message)
+    let outcome = call.try_call(
+            addr: recipient,
+            gas: ctx.gas(),
+            value: Wei::zero(),
+            message,
+        )
     if outcome.success() {
         if decode_bytes4(outcome.returndata()) != ON_ERC721_RECEIVED_SELECTOR {
             revert_error(InvalidERC721Recipient { recipient })
         }
         return
     }
-    match try_decode_error_string(outcome.returndata()) {
-        Option::Some(reason,) => revert_error(
-            ERC721ReceiverErrorRevertString {
-                reason,
-                receiver: recipient,
-                sender: ctx.caller(),
-                identifier: token_id,
-            },
-        ),
-        Option::None => revert_error(
-            ERC721ReceiverErrorRevertBytes {
-                reason: Bytes::from_payload(source: outcome.returndata()),
-                receiver: recipient,
-                sender: ctx.caller(),
-                identifier: token_id,
-            },
-        ),
+    // ERC721ReceiverErrorRevertString with an `Error(string)` message,
+    // ERC721ReceiverErrorRevertBytes with the whole returndata otherwise.
+    let returned = outcome.returndata()
+    var selector = error_selector<ERC721ReceiverErrorRevertBytes>()
+    var start: u256 = 0
+    var length = returned.len() as u256
+    match try_decode_error_string(returned) {
+        Option::Some((at, len)) => {
+            selector = error_selector<ERC721ReceiverErrorRevertString>()
+            start = at
+            length = len
+        },
+        Option::None => {},
     }
+    revert_with_reason3(
+        selector,
+        reason: returned
+            .slice(
+                offset: start.downcast_unchecked(),
+                len: length.downcast_unchecked(),
+            ),
+        a: recipient.word(),
+        b: ctx.caller().word(),
+        c: token_id,
+    )
 }
 
 /// `bulkTransfer`
@@ -199,25 +207,32 @@ uses (ctx: Ctx, call: mut Call, ops: RawOps)
         salt: conduit_key,
         init_code_hash: env.conduit_creation_code_hash,
     )
-    let mut total: u256 = 0
-    let mut i: u256 = 0
+    var total: usize = 0
+    var i: usize = 0
     while i < transfers.len() {
         total = total + transfers.get(i).items.len()
         i += 1
     }
-    let mut conduit_transfers = MemVec<ConduitTransfer>::zeroed(total)
-    let mut index: u256 = 0
+    // `execute(ConduitTransfer[])` calldata: the selector, the array offset
+    // and length, then six words per transfer.
+    var data = Buffer::new(0x44 + total as u256 * 0xc0)
+    unsafe {
+        data.put(offset: 0, value: CONDUIT_EXECUTE_SELECTOR << 224)
+        data.put(offset: 4, value: 0x20)
+        data.put(offset: 0x24, value: total as u256)
+    }
+    var at: u256 = 0x44
     i = 0
     while i < transfers.len() {
         let transfer = transfers.get(i)
         let recipient = transfer.recipient
-        if recipient.inner == 0 {
+        if recipient.word() == 0 {
             revert_error(RecipientCannotBeZeroAddress {})
         }
         let call_erc721_receiver = transfer.validateERC721Receiver
             && ctx.extcodesize(recipient) != 0
         let items = transfer.items
-        let mut j: u256 = 0
+        var j: usize = 0
         while j < items.len() {
             let item = items.get(j)
             if item.itemType > 3 {
@@ -230,29 +245,26 @@ uses (ctx: Ctx, call: mut Call, ops: RawOps)
             if item.itemType == 2 && call_erc721_receiver {
                 check_erc721_receiver(conduit, recipient, token_id: item.identifier)
             }
-            conduit_transfers
-                .set(
-                    index,
-                    value: ConduitTransfer {
-                        itemType: item.itemType,
-                        token: item.token,
-                        from: ctx.caller(),
-                        to: recipient,
-                        identifier: item.identifier,
-                        amount: item.amount,
-                    },
-                )
-            index += 1
+            // `total` counts this transfer, so its words lie in the buffer.
+            unsafe {
+                data.put(offset: at, value: item.itemType as u256)
+                data.put(offset: at + 0x20, value: item.token.word())
+                data.put(offset: at + 0x40, value: ctx.caller().word())
+                data.put(offset: at + 0x60, value: recipient.word())
+                data.put(offset: at + 0x80, value: item.identifier)
+                data.put(offset: at + 0xa0, value: item.amount)
+            }
+            at += 0xc0
             j += 1
         }
         i += 1
     }
     let outcome = call
-        .try_call(
+        .try_call_raw(
             addr: conduit,
             gas: ctx.gas(),
-            value: 0,
-            message: ConduitMsg::Execute { transfers: conduit_transfers.to_dyn_array() },
+            value: Wei::zero(),
+            args: data.span(),
         )
     if outcome.success() {
         if decode_bytes4(outcome.returndata()) != CONDUIT_EXECUTE_SELECTOR {
@@ -264,13 +276,19 @@ uses (ctx: Ctx, call: mut Call, ops: RawOps)
     }
     let data = outcome.returndata()
     match try_decode_error_string(data) {
-        Option::Some(reason,) => revert_error(
-            ConduitErrorRevertString { reason, conduitKey: Bytes32 { val: conduit_key }, conduit },
+        Option::Some((at, len)) => revert_with_reason2(
+            error_selector<ConduitErrorRevertString>(),
+            reason: data.slice(
+                offset: at.downcast_unchecked(),
+                len: len.downcast_unchecked(),
+            ),
+            a: conduit_key,
+            b: conduit.word(),
         ),
         Option::None => {},
     }
     let selector = if data.len() >= 4 {
-        load_word(data.ptr()) >> 224
+        return_word(data, initial: 0) >> 224
     } else {
         0
     }
@@ -278,12 +296,11 @@ uses (ctx: Ctx, call: mut Call, ops: RawOps)
         || (data.len() == 36 && selector == INVALID_ERC721_TRANSFER_AMOUNT_SELECTOR) {
         ops.revert(data)
     }
-    revert_error(
-        ConduitErrorRevertBytes {
-            reason: Bytes::from_payload(source: data),
-            conduitKey: Bytes32 { val: conduit_key },
-            conduit,
-        },
+    revert_with_reason2(
+        error_selector<ConduitErrorRevertBytes>(),
+        reason: data,
+        a: conduit_key,
+        b: conduit.word(),
     )
 }
 

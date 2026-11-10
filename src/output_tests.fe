@@ -1,0 +1,91 @@
+use core::ptr::MemArray
+use std::evm::Address
+use super::applier::ExecutionState
+use super::combiner::{encode_available, execution_array}
+
+#[test]
+fn execution_output_truncates_item_types_and_keeps_words() {
+    var executions = MemArray<ExecutionState>::new_zeroed(2)
+    executions[0] = ExecutionState {
+        item_type: 0x102,
+        token: Address::new(17),
+        identifier: 1 << 255,
+        amount: 5,
+        recipient: Address::new(23),
+        offerer: Address::new(29),
+        conduit_key: !(0 as u256),
+    }
+    executions[1] = ExecutionState {
+        item_type: 1,
+        token: Address::new(18),
+        identifier: 0,
+        amount: 6,
+        recipient: Address::new(24),
+        offerer: Address::new(30),
+        conduit_key: 7,
+    }
+    let output = execution_array(executions)
+    assert(output.len() == 2 && output.encoded_size() == 32 + 2 * 224)
+    let first = output.get(0)
+    assert(
+        first.item.itemType == 2 && first.item.token == Address::new(17),
+    )
+    assert(
+        first.item.identifier == 1 << 255 && first.item.amount == 5,
+    )
+    assert(
+        first.item.recipient == Address::new(23) && first.offerer == Address::new(29),
+    )
+    assert(first.conduitKey.val == !(0 as u256))
+    let second = output.get(1)
+    assert(
+        second.item.itemType == 1 && second.item.token == Address::new(18),
+    )
+    assert(second.item.identifier == 0 && second.item.amount == 6)
+    assert(
+        second.item.recipient == Address::new(24) && second.offerer == Address::new(30),
+    )
+    assert(second.conduitKey.val == 7)
+    let empty = execution_array(MemArray<ExecutionState>::new_zeroed(0))
+    assert(empty.len() == 0 && empty.encoded_size() == 32)
+}
+
+#[test]
+fn available_output_encodes_flags_and_executions() {
+    var values = MemArray<bool>::new_zeroed(3)
+    values[0] = true
+    values[2] = true
+    var executions = MemArray<ExecutionState>::new_zeroed(1)
+    executions[0] = ExecutionState {
+        item_type: 0x103,
+        token: Address::new(17),
+        identifier: 4,
+        amount: 5,
+        recipient: Address::new(23),
+        offerer: Address::new(29),
+        conduit_key: 7,
+    }
+    let output = encode_available(values, executions)
+    assert(output.len() == 0xc0 + 32 + 224)
+    assert(
+        output.word(0) == 0x40 && output.word(32) == 0xc0 && output.word(0x40) == 3,
+    )
+    assert(
+        output.word(0x60) == 1 && output.word(0x80) == 0 && output.word(0xa0) == 1,
+    )
+    assert(output.word(0xc0) == 1 && output.word(0xe0) == 3)
+    assert(
+        output.word(0x100) == 17 && output.word(0x120) == 4 && output.word(0x140) == 5,
+    )
+    assert(
+        output.word(0x160) == 23 && output.word(0x180) == 29 && output.word(0x1a0) == 7,
+    )
+    let empty = encode_available(
+        MemArray<bool>::new_zeroed(0),
+        executions: MemArray<ExecutionState>::new_zeroed(0),
+    )
+    assert(
+        empty.len() == 128 && empty.word(0) == 0x40 && empty.word(32) == 0x60,
+    )
+    assert(empty.word(0x40) == 0 && empty.word(0x60) == 0)
+}

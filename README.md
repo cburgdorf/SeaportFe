@@ -23,6 +23,7 @@ The library code follows the `seaport-core` structure:
 
 | Module | seaport-core |
 | --- | --- |
+| `abi_view.fe` | argument checks and calldata reads of ConsiderationDecoder |
 | `model.fe` | decoded orders as a mutable in-memory model (ConsiderationDecoder) |
 | `hashing.fe` | ConsiderationBase, GettersAndDerivers |
 | `status.fe` | CounterManager, OrderValidator storage, ReentrancyGuard |
@@ -44,12 +45,146 @@ and write order status slots directly).
 
 ## Compiler
 
-The port is built with Fe `upstream/master` plus all open pull requests by
-cburgdorf, merged into the local branch `seaport-integration` of
-`toolchain/fe`. Compiler defects found during the port are fixed on separate
-branches; see [COMPILER_FIXES.md](COMPILER_FIXES.md). All problems
-encountered, including language and library gaps, are logged in
-[ISSUES.md](ISSUES.md).
+This branch targets Fe master
+[`5cebf09af44eaaf5e81302eecff01d519bf48f7b`](https://github.com/argotorg/fe/commit/5cebf09af44eaaf5e81302eecff01d519bf48f7b),
+which includes mutable value semantics (MVS), `usize` collection lengths
+([argotorg/fe#1810](https://github.com/argotorg/fe/pull/1810)), the `Wei`
+and `Timestamp` units ([argotorg/fe#1719](https://github.com/argotorg/fe/pull/1719)),
+portable `usize` casts ([argotorg/fe#1883](https://github.com/argotorg/fe/pull/1883))
+and owning `DynArray` and `Bytes`
+([argotorg/fe#1914](https://github.com/argotorg/fe/pull/1914)).
+Protocol amounts and times, and the order model's item positions, stay
+`u256`; they are converted where they meet a collection length, a memory
+offset or an EVM call, with `downcast_unchecked`, which is exact on the EVM.
+Its committed Cargo dependencies pin
+Sonatina `5a44318d34c0701eaedf9e3485d5241459820cbb`.
+`scripts/bootstrap.py` builds this exact compiler with `cargo build --locked
+--release -p fe`, without dependency substitutions or compiler patches, and
+the contracts at `-Os`. The compiler and reference revisions and the build
+level are recorded in `reference_manifest.json`.
+
+The source baseline is SeaportFe `6ffc19564ecc3121bfbf0cc7752b9c7a81cb7eea`,
+which passes `fe check` and builds all eight contracts on Fe master
+`26e1fddd269c020ed41f77aa8777d2dc83c1c252`.
+It includes direct component hashing, constant bulk-order typehashes, and
+immutable environment passing. Later local calldata and output-buffer
+changes are deferred: their `#[decode(manual)]` dispatch feature is absent
+from both that master revision and MVS.
+
+Mutable owned locals use `var`; `mut` continues to grant write access to
+parameters and places, and `ref` keeps a read access. Book, Resolvers, and
+Groups own non-Copy MemArray pools. Order descriptors retain immutable Bytes
+signatures and extra data, and helpers use scoped MVS views or explicit mutable
+parameters. Generated orders replace the item pool
+in place. Output arrays are filled in a `MemArray` and encoded with
+`DynArray::from_slice`; exact protocol encoders use a checked, initialized
+owning byte buffer. Copyable raw pool and byte handles
+have been removed. Explicit unsafe blocks fell from 333 to six: three inside
+the checked byte boundary in `buffer.fe`, and three order-pool allocations in
+`model.fe`. Every order record, including its immutable Bytes handles, is
+fully initialized before the pool is read or returned; these records cannot
+be constructed by zeroing bytes. Storage uses declared owners:
+`OrderStore` at slot 0 contains the counter, status and nonce mappings;
+conduits use a rooted map and `SolEnumerableSet` for their channel registry;
+zones retain their exact packed words. Persistent and transient guard fields
+share the protocol's numeric slot in their respective address spaces. The
+guard takes short accesses before and after external calls, and its constructor
+probe uses an initialized word array. No application raw storage operations or
+copyable raw owner handles remain.
+`COMPILER_FIXES.md` and `compiler/seaport-integration.patch` describe the
+historical toolchain; neither is used to build this branch.
+
+<!-- size-gas:begin -->
+## Size and gas
+
+Runtime bytes and receipt gas with the compiler above at `-Os` (the build
+level) and at `-O1`. Before: the contracts before the size work (#2) on Fe
+e8612c21d at `-O1`. solc: the pinned Seaport's optimized artifacts.
+Receipt gas comes from `tests/rooted-storage.cjs` in transient guard mode, on
+identical calls.
+
+| Contract | Before | `-Os` | `-O1` | solc |
+| --- | ---: | ---: | ---: | ---: |
+| Seaport | 52,760 | 21,696 | 23,058 | 23,963 |
+| Consideration | 52,766 | 21,702 | 23,064 | 23,969 |
+| Conduit | 3,514 | 2,429 | 2,472 | 2,850 |
+| ConduitController | 6,305 | 4,985 | 5,097 | 7,298 |
+| TransferHelper | 4,318 | 3,264 | 3,356 | 3,712 |
+| SeaportRouter | 10,688 | 4,630 | 4,806 | 6,759 |
+| PausableZone | 6,498 | 5,920 | 6,073 | 6,162 |
+| PausableZoneController | 12,731 | 12,247 | 12,577 | 12,730 |
+| Total | 149,580 | 76,873 | 80,503 | 87,443 |
+
+| Call | Before | `-Os` | `-O1` | solc |
+| --- | ---: | ---: | ---: | ---: |
+| Advanced ERC721/native self fulfillment | 127,430 | 111,774 | 111,777 | 113,085 |
+| Validate one order | 56,227 | 40,276 | 39,992 | 40,064 |
+| Cancel one order | 40,223 | 32,735 | 32,443 | 33,272 |
+| Increment counter | 29,167 | 27,967 | 28,013 | 27,976 |
+| getOrderStatus (cold) | 25,002 | 23,720 | 23,766 | 23,669 |
+| name (cold) | 22,483 | 21,288 | 21,334 | 21,240 |
+| getCounter (cold) | 24,085 | 24,055 | 23,837 | 24,109 |
+| Create conduit | 816,316 | 598,589 | 607,109 | 676,738 |
+| Create zone | 1,371,276 | 1,254,904 | 1,285,657 | 1,297,167 |
+| Open a channel | 120,229 | 120,214 | 120,276 | 120,891 |
+| Transfer conduit ownership | 49,806 | 49,806 | 49,697 | 50,233 |
+
+Every contract is below its solc size at both levels, and Seaport and
+Consideration fit under the 24,576-byte EIP-170 limit. Of the measured calls,
+only validateOrder (+212 at `-Os`), getOrderStatus (+51), the zone
+controller's assignOperator (+76) and pause (+60), and the name getter (+48)
+cost more than with solc.
+
+Against Fe 22b156fff at `-Os` (Seaport 21,513 bytes, 78,342 in total),
+Seaport and Consideration grow by 183 bytes, while TransferHelper shrinks by
+178, SeaportRouter by 78, PausableZone by 510 and PausableZoneController,
+which embeds the zone's initcode, by 1,069. The difference comes from
+Sonatina's inliner, which now charges a callee's growth net of the call it
+removes ([fe-lang/sonatina#503](https://github.com/fe-lang/sonatina/pull/503)).
+Zone creation costs 102,344 less gas, getOrderStatus 50 less, fulfillment 22
+less, and the zone controller's assignOperator and pause 9 less each. The
+table's other `-Os` calls are unchanged.
+
+Compiler changes behind these numbers, all on Fe master:
+- Messages and custom errors encode into one buffer, and bools as one word
+  store ([argotorg/fe#1851](https://github.com/argotorg/fe/pull/1851)).
+- IR reaches the reserved free-pointer slot only through immediate addresses
+  ([fe-lang/sonatina#419](https://github.com/fe-lang/sonatina/pull/419)). The
+  free pointer is set once at the section entry, so heap allocations need no
+  clamp, and keccak preimages and small once-per-call buffers that never
+  escape live in the frame
+  ([fe-lang/sonatina#422](https://github.com/fe-lang/sonatina/pull/422)).
+- The size pipeline inlines more and has a larger total inline budget
+  ([fe-lang/sonatina#423](https://github.com/fe-lang/sonatina/pull/423)).
+- Whole-aggregate stores keep their other fields across partial writes, and
+  one-word ABI encodes are inlined
+  ([fe-lang/sonatina#437](https://github.com/fe-lang/sonatina/pull/437),
+  [argotorg/fe#1873](https://github.com/argotorg/fe/pull/1873)).
+
+These results were first reached with size-optimized forks of Fe
+(`sbillig/fe` `opt/seaport-size-20261019`) and Sonatina (`6f264b46`). Against
+that build, the Fe e8612c21d build's Seaport was 228 bytes smaller and
+fulfillment 55 gas cheaper; getOrderStatus cost 50 more and validateOrder 20
+more.
+
+Contract changes:
+- The fulfillment, match, validate, cancel and getOrderHash arms read their
+  arguments straight from calldata through `CalldataView` (`src/abi_view.fe`),
+  with seaport-core's checks. Order hashes come from raw calldata words.
+- Outputs, events and errors are encoded directly into their final buffers
+  (`src/raw_abi.fe`).
+- SeaportRouter reads its parameters from calldata with solc's checks;
+  `tests/router-diff.cjs` compares it with the solc router.
+- Settlement, aggregation and transfers are merged into shared paths, and
+  arithmetic is unchecked wherever seaport-core's is. Pool elements are
+  reached without a checked multiply.
+- Functions on the deepest call chains are kept out of line, so each takes a
+  frame of its own. The heap base drops from 0x1140 to 0x740. The order model
+  is built in two passes, with raw words copied from calldata in one copy.
+- The name getter writes its return data directly, like Seaport's `_name()`.
+
+The behavior differences for malformed input are listed under Limitations.
+<!-- size-gas:end -->
 
 ## Tests
 
@@ -65,14 +200,56 @@ Seaport's own test suites run against the Fe bytecode:
 - `scripts/compare_abi.py` compares the Fe JSON ABIs with the Solidity
   artifacts (functions with outputs and mutability, events, errors).
 
-Results with the current build (`seaport-integration` at the head recorded
-in `reference_manifest.json`, `fe build -O 1`):
+`tests/rooted-storage.cjs` additionally compares exact map/record/array slots,
+packed status and zone updates, channel swap/removal and ownership events,
+and both guard modes against the pinned Solidity artifacts. It records receipt
+gas for identical calls, including cold getters sent as transactions. The
+fallback case changes only test initcode's feature-probe payload to INVALID;
+production bytecode is unchanged. This exercises fallback
+on the compiler's supported Cancun target instead of trying to deploy Cancun
+instructions on an older fork. It then changes the deployed test probe to STOP
+to exercise activation. After compiling the reference artifacts and building
+Fe contracts into `build/fe`, run:
 
-| Suite | Solidity (pinned reference) | Fe |
-| --- | --- | --- |
-| Foundry, `upstream_suite.py` | 482 passed | 482 passed |
-| Hardhat, `hardhat_suite.py` | 402 passing, 1 pending | 402 passing, 1 pending |
-| Foundry, `upstream_suite.py --both` | 482 passed | 480 passed |
+```sh
+cd reference/seaport
+./node_modules/.bin/hardhat run --no-compile --config ../../tests/hardhat.config.ts ../../tests/rooted-storage.cjs
+```
+
+Set `SEAPORT_VARIANTS` to a JSON array of `[label, Fe build directory]` pairs
+(use `null` for pinned Solidity) to compare multiple Fe builds. Set
+`SEAPORT_REPORT` to save the gas results as JSON. Each variant and guard mode
+starts from a fresh chain. Set `SEAPORT_TRACE_HASHES=1` to count the exact
+`keccak256(conduit, 0)` map preimages and assert log/write ordering for
+transfer, cancellation and acceptance. The test compares full event bytes
+and checks that each event precedes its corresponding storage write.
+
+Fe master 5cebf09af builds all eight production contracts at `-Os` and
+`-O1`, and their ABIs are unchanged from the 22b156fff build. The `-Os` build
+passes all 27 Fe tests, all 482 Foundry tests (1,000 cases per fuzz test), the
+full Hardhat suite (402 passing, one pending) and `scripts/compare_abi.py`.
+The `-O1` build also passes all 482 Foundry tests. The rooted-storage
+differential passes for pinned Solidity and both levels, in transient and forced persistent guard modes,
+including exact storage slots, event bytes, map hashes, and log/write
+ordering. `tests/router-diff.cjs` compares 5,039 router calls with the solc
+router and finds only the four documented `Panic(0x41)` differences; with
+`RELATIVE=1`, all 963 shifted calls match.
+
+The build retains the two documented `--both` Foundry differences:
+480 pass and `testRevertErc20Transfer` / `testMatchAuthRevertAndInvMagicValue`
+fail when the optimized port also replaces Solidity's reference behavior.
+
+Historical October 11 verification used Fe 093ff36d5 / Sonatina 11722eac at `-O1`.
+All eight production contracts build and their ABIs are unchanged from the
+initial MVS port. The full upstream results match the documented pre-MVS
+results:
+
+| Suite | Observed result |
+| --- | --- |
+| Fe tests | 12 passed |
+| Foundry, optimized artifacts replaced | 482 passed; 1,000 cases per fuzz test |
+| Hardhat, all eight contracts replaced | 402 passing, 1 pending |
+| Foundry, optimized and reference artifacts replaced | 480 passed, 2 documented expected failures |
 
 The two `--both` failures are expected: `testRevertErc20Transfer` and
 `testMatchAuthRevertAndInvMagicValue` assert behavior that differs on
@@ -81,23 +258,96 @@ port follows the optimized one.
 
 The ABIs match except for listings: Solidity lists every error of the
 inherited interfaces and the shared events of `PausableZone` and its
-controller, Fe lists the errors a contract can raise (plus `Panic`), and Fe
-marks `PausableZone.supportsInterface` as `pure`, not `view`. The basic
-order entry points and the conduit batch functions use numeric selectors
-(their calldata is read raw), so they have no ABI entry.
+controller, Fe lists the errors a contract can raise, and Fe
+marks `PausableZone.supportsInterface` as `pure`, not `view`, and the
+`name()` of Seaport and Consideration as `view`, not `pure`: its arm returns
+the hand-encoded name through `RawOps`. The order
+entry points (fulfill, match, validate, cancel, `getOrderHash`), the
+conduit's `execute` functions and PausableZone's `authorizeOrder` and
+`validateOrder` use numeric selectors (their calldata is read raw), so they
+have no ABI entry. `SeaportMsg` keeps the typed forms for callers.
+`OrderValidated`, `OrderCancelled`, `OrderFulfilled` and `OrdersMatched` are
+written with raw log operations, and custom errors with static fields revert
+through the shared encoders of `raw_abi.fe`; the Fe ABI walk only sees typed
+emits and `revert_error` calls, so it lists neither. `scripts/compare_abi.py`
+checks exactly these differences.
 
 ## Limitations
 
-- Code size: the Fe `Seaport` runtime is about 65 KB (154 KB before the
-  rebase onto upstream PR #1618), still well above the 24 KB EIP-170 limit
-  that the Solidity build just meets (ISSUES.md #13). `Seaport` and
-  `Consideration` deploy only with the size limit lifted; both test scripts
-  do that. The periphery contracts are within 1.0 to 1.6 times their
-  Solidity size and below the limit. Sizes per contract are in
-  [COMPILER_FIXES.md](COMPILER_FIXES.md).
-- Gas: Fe code uses more gas than the hand-optimized assembly of
-  seaport-core. Tests that pin gas budgets pass, but absolute costs are
-  higher. The same calls in the same Foundry test (`test_fuzzCoverage_x`):
+- Order arguments are read from calldata as seaport-core reads them: the
+  Solidity dispatcher's head checks, then 32-bit masked offsets and lengths,
+  zero-padded reads, raw words in order hashes, and enum checks
+  (`Panic(0x21)`) where Seaport reads an enum from memory. Signatures, extra
+  data, criteria resolvers and fulfillment components are read in place
+  rather than copied. Three differences remain for malformed calldata. The
+  model holds addresses truncated, as Solidity's typed reads see them:
+  zones and contract offerers receive truncated item and offerer words where
+  seaport-core copies the raw words, and fulfillment aggregation and
+  offer/consideration matching compare truncated tokens, offerers and
+  recipients where seaport-core compares the raw words. Seaport copies the
+  in-place values before use, so absurd 32-bit lengths that exhaust its gas
+  while copying only fail here if the value is read. And a basic order with
+  more additional recipients than memory can hold reverts with
+  `Panic(0x41)` (`Panic(0x11)` if its event size overflows), where
+  seaport-core runs out of gas.
+- SeaportRouter validates `fulfillAvailableAdvancedOrders` parameters from
+  calldata with solc's checks, in solc's order, and decodes Seaport's
+  `(bool[], Execution[])` returndata strictly. One difference remains: for a
+  bytes or array length below 2^64 that exceeds what solc's free-memory
+  pointer can still address, solc reverts with `Panic(0x41)` and Fe reverts
+  without data. `tests/router-diff.cjs` finds no other difference in the
+  calls the router forwards for a first and a second group or in its
+  returndata decoding; it sends no value, which the Hardhat suite covers.
+- PausableZone's `authorizeOrder` and `validateOrder` check only the
+  `ZoneParameters` offset and 320-byte head, as Solidity does for a calldata
+  struct it never reads, instead of decoding the whole struct.
+- The periphery decodes some calldata earlier than solc reads it.
+  `Conduit.execute` and TransferHelper's `bulkTransfer` check a transfer's
+  addresses as they decode it, so a dirty address reverts without data where
+  Solidity first reports `InvalidItemType`, `InvalidERC721TransferAmount` or
+  `InvalidERC20Identifier`. PausableZone passes the orders and fulfillments
+  its operator sends on to Seaport as encoded, and returns Seaport's
+  executions unchecked; Solidity's re-encoding rejects dirty addresses and
+  out-of-range enums in them. So the operator can complete a match that
+  Solidity's zone would reject, such as one with high bits in a recipient
+  word; Seaport then pays the truncated address, as it does when called
+  directly.
+- A Fe `Address` holds no bits above the low 160. Raw words become addresses
+  either after the check Solidity performs (basic orders, conduit transfers)
+  or by truncation, like Solidity's masked storage reads. The conduit batch
+  path reports the raw token word in its errors, as seaport-core does. One
+  difference remains: a contract offerer whose `generateOrder` returndata has
+  high bits in an extra offer item's token or in a recipient the original
+  order leaves open gets the truncated address. seaport-core keeps the raw
+  word. Returned items that have an original are still compared word for word.
+- Code size: with the compiler above at `-Os`, the Seaport and Consideration
+  runtimes are 21,513 and 21,519 bytes, under the 24 KB EIP-170 limit
+  (ISSUES.md #13); see [Size and gas](#size-and-gas). Earlier builds, before
+  the size work, were above the limit, and both upstream harnesses lift it.
+  Fe master e8612c21d / committed Sonatina 6bd0ce66 at `-Os` produced
+  21,705/21,711-byte Seaport/Consideration runtimes and periphery runtimes of
+  2,478 to 11,784 bytes; before the size work, at `-O1`, it produced
+  52,760/52,766-byte Seaport/Consideration runtimes and periphery runtimes of
+  3,514 to 12,731 bytes. Fe master fa06c6cd5 / Sonatina fcdbdc4d produced
+  53,579/53,585-byte Seaport/Consideration runtimes and periphery runtimes of
+  3,544 to 12,929 bytes. Fe master 735827147 / Sonatina 6bef907f produced
+  57,339/57,345-byte Seaport/Consideration runtimes and periphery runtimes of
+  4,200 to 14,554 bytes. Fe master 33ee9be28 / Sonatina cdb34cbb produced
+  58,266/58,272-byte Seaport/Consideration runtimes, and periphery runtimes of
+  4,450 to 14,538 bytes. The historical Fe 093ff36d5 / Sonatina 11722eac build
+  produced 57,600/57,606-byte Seaport/Consideration runtimes. The prior raw-storage/rooted-owner comparison on Fe d6c0f863e
+  produced 57,412/57,681-byte Seaport and 57,418/57,687-byte Consideration
+  runtimes. The earlier compiler-update growth from 49,815 bytes on Fe
+  169ed8ce3 to 57,418 on c329ceff3 remains unexplained; it is separate from
+  this storage refactor.
+- Gas: validateOrder, getOrderStatus, the name getter and the zone
+  controller's assignOperator and pause still cost more than seaport-core's
+  hand-optimized assembly, and zone creation costs more because the
+  PausableZone runtime is larger than solc's; see
+  [Size and gas](#size-and-gas). The October 11 upstream behavioral suites,
+  including gas-budget cases, pass. The following
+  pre-MVS measurements are historical; these calls
+  came from one Foundry test (`test_fuzzCoverage_x`):
 
   | Call | Solidity | Fe |
   | --- | --- | --- |
@@ -110,9 +360,74 @@ order entry points and the conduit batch functions use numeric selectors
   (upstream #1618) cost about 5 to 8% gas on these calls in exchange for
   the smaller code.
 
-  Most of the difference is fixed cost per call: ABI decoding into the
-  in-memory order model and memory management, where seaport-core works on
-  calldata pointers directly.
+  Most of the difference is fixed cost per call: copying orders into the
+  in-memory model and memory management.
+
+  The prior rooted-storage differential benchmark compared the raw source at
+  d176b8c and rooted owners at efd2b89, both built with d6c0f863e / Sonatina
+  361e0e86.
+  Transaction receipt gas includes the same calldata and intrinsic costs:
+
+  | Call | Raw storage | Rooted owners | Change |
+  | --- | ---: | ---: | ---: |
+  | Validate one order | 56,217 | 55,893 | -324 |
+  | Fulfill one advanced ERC721/native order | 128,666 | 128,857 | +191 |
+  | Open a channel | 120,442 | 120,635 | +193 |
+  | Cancel one order | 38,773 | 38,859 | +86 |
+  | Increment counter | 28,110 | 28,116 | +6 |
+
+  These are focused cases, not an overall gas claim. Cancel and validate use
+  empty item arrays; fulfillment uses one ERC721 and one native consideration
+  item. In each case the caller is the offerer, skipping signature checks.
+  Scoped entries avoid
+  repeated map lookup work within a phase. Further gains need the std map's
+  fixed-word keys to use the existing value-level word hash; its current
+  encoder allocates a preimage for each lookup.
+  Fe 420a3bd52 fixes the generic `Ctx`/`Log` conflict. Ownership helpers now
+  keep one mutable entry across caller reads, logs and writes in Solidity's
+  order. Accesses still close before external calls. Both efd2b89 and
+  78c170e were rebuilt with that compiler and Sonatina 361e0e86:
+
+  | Ownership call | efd2b89 gas | 78c170e gas | Map hashes, before → after |
+  | --- | ---: | ---: | ---: |
+  | Transfer | 49,956 | 49,882 | 2 → 1 |
+  | Cancel transfer | 27,701 | 27,635 | 2 → 1 |
+  | Accept | 32,438 | 32,315 | 3 → 1 |
+
+  The hash counts come from exact 64-byte controller map preimages in EVM
+  traces. The same savings hold in both guard modes. Channel open/remove save
+  6/5 gas; the other measured calls are unchanged. ConduitController shrinks
+  from 8,522 to 8,467 runtime bytes. Comparing efd2b89 under d6c0f863e and
+  420a3bd52 shows unchanged receipt gas in these cases and a separate seven
+  byte reduction in Seaport and Consideration. No operand-order rejections
+  occurred in either source version. Historical evidence is recorded in
+  `build/sealed-capabilities-420/validation.json`.
+
+  The historical locked Fe 093ff36d5 / Sonatina 11722eac build leaves contract
+  source unchanged from 78c170e. Re-running its previous artifacts reproduces
+  every prior receipt exactly. The update changes focused receipt gas:
+
+  | Call | Previous build | Current build | Change |
+  | --- | ---: | ---: | ---: |
+  | Cancel one order | 38,859 | 39,221 | +362 |
+  | Validate one order | 55,893 | 56,274 | +381 |
+  | Advanced ERC721/native self fulfillment | 128,857 | 129,529 | +672 |
+  | Name getter | 22,446 | 22,834 | +388 |
+  | Create conduit | 1,077,606 | 1,026,126 | -51,480 |
+  | Create zone | 1,468,559 | 1,447,815 | -20,744 |
+
+  The same deltas hold in both guard modes. Getters are sent as cold
+  transactions; the name case was added and measured on both old and new
+  artifacts in this run. Counter, empty order-status, conduit-owner and zone
+  getters are cheaper by 13 to 75 gas. The harness records intrinsic calldata
+  gas separately; it is equal across these comparisons. Ownership map hashes
+  remain one per call. These larger increases are reported without source
+  workarounds. Sonatina #392 fixes recovered-pointer liveness, but this
+  Seaport comparison does not attribute each cost to #392 alone: the update
+  also includes #398–#402 and rebased PR 397. Evidence, all receipt deltas and
+  runtime sizes are in `build/committed-sonatina-093/validation.json`.
+- Explicit ABI view annotation would let `getOrderHash` match Solidity without
+  retaining a read-only context grant purely for ABI classification.
 - The SeaportValidator and SeaportNavigator helpers (off-chain view
   contracts in `contracts/helpers/`) are not ported; the Foundry tests that
   use them deploy the Solidity versions.
@@ -125,9 +440,8 @@ scripts/upstream_suite.py
 scripts/hardhat_suite.py
 ```
 
-`bootstrap.py` clones the pinned Seaport revision, builds its Foundry and
-Hardhat artifacts, clones Fe at the pinned base and applies
-`compiler/seaport-integration.patch` (the full difference of the
-`seaport-integration` branch, checked against `reference_manifest.json`),
-then builds the compiler and the Fe contracts into `build/fe`. Required
-tools: git, Rust, Node with yarn, Foundry.
+`bootstrap.py` clones the pinned Seaport revision and builds its Foundry and
+Hardhat artifacts, then builds the pinned Fe master compiler and contracts into
+`build/fe`. An existing `toolchain/fe` must be at the exact pinned revision
+with no tracked changes. Required tools: git, Rust, Node with npm, Foundry.
+Yarn 1.22.22 is invoked through npx for the reference's frozen lockfile.

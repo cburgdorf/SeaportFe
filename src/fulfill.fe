@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // OrderValidator._validateOrder, OrderFulfiller and the order event helpers.
-use core::ptr
-use std::abi::{Bytes32, DynArray, MemVec}
-use std::evm::{Address, Call, Ctx, Log, RawOps, revert_error}
+use std::abi::{Bytes32, DynArray}
+use std::evm::{TSlot, Address, Call, Ctx, Event, Log, RawOps, revert_error}
+use super::raw_abi::{error_selector, revert_with0, revert_with2}
+use super::buffer::{Buffer, store_at}
 use super::amount::apply_fraction
-use super::arr::Arr
+use core::ptr::MemArray
 use super::criteria::apply_criteria_resolvers
 use super::errors::{
     BadFraction,
@@ -16,31 +17,30 @@ use super::errors::{
     PartialFillsNotEnabledForOrder,
 }
 use super::executor::{
-    Accumulator,
-    Transfer,
     new_accumulator,
-    transfer,
     transfer_buffer,
+    transfer_item,
     transfer_native_tokens,
     trigger_if_armed,
 }
 use super::hashing::{Env, derive_order_hash}
-use super::model::{Book, Item, OrderState, Resolvers}
+use super::model::{Book, Item, OrderState, Resolvers, checked_enum, element}
 use super::signature::verify_signature
 use super::status::{
+    OrderStore,
     adjust_fill_fraction,
     clear_reentrancy_guard,
     get_counter,
     set_reentrancy_guard,
-    status_slot,
+    raw_status,
     unpack_status,
     update_status,
     verify_order_status,
 }
-use super::types::{CONTRACT, NATIVE, ReceivedItem, SpentItem}
+use super::types::{CONTRACT, NATIVE}
 use super::zone::{
-    assert_restricted_advanced_order_authorization,
     assert_restricted_advanced_order_validity,
+    check_restricted_advanced_order_authorization,
     generate_order,
     install_generated_order,
 }
@@ -49,32 +49,34 @@ use super::zone::{
 pub fn verify_time(start_time: u256, end_time: u256, revert_on_invalid: bool) -> bool
 uses (ctx: Ctx)
 {
-    let valid = start_time <= ctx.timestamp() && end_time > ctx.timestamp()
+    let valid = start_time <= ctx.timestamp().as_seconds()
+        && end_time > ctx.timestamp().as_seconds()
     if revert_on_invalid && !valid {
-        revert_error(InvalidTime { startTime: start_time, endTime: end_time })
+        revert_with2(error_selector<InvalidTime>(), start_time, end_time)
     }
     valid
 }
 
 /// `_assertConsiderationLengthAndGetOrderHash`
-pub fn consideration_length_checked_order_hash(_ book: Book, order: *OrderState) -> u256
-uses (ops: RawOps)
+pub fn consideration_length_checked_order_hash(_ order: OrderState) -> u256
+uses (store: OrderStore)
 {
     if order.consideration_len < order.total_original {
-        revert_error(MissingOriginalConsiderationItems {})
+        revert_with0(error_selector<MissingOriginalConsiderationItems>())
     }
-    derive_order_hash(book, order, counter: get_counter(order.offerer))
+    derive_order_hash(
+        order.params,
+        consideration_count: order.total_original,
+        counter: get_counter(order.offerer),
+    )
 }
 
 /// `_validateOrder`: the order hash and the fraction that can be filled now,
 /// or a zero fraction for an order that is not fillable (only when
 /// `revert_on_invalid` is false). Contract orders yield `(1, 1, 1)`.
-pub fn validate_order(_ env: Env, book: Book, order: *OrderState, revert_on_invalid: bool) -> (
-    u256,
-    u256,
-    u256,
-)
-uses (ctx: Ctx, call: Call, ops: RawOps)
+#[arithmetic(unchecked)]
+pub fn validate_order(_ env: Env, order: OrderState, revert_on_invalid: bool) -> (u256, u256, u256)
+uses (store: OrderStore, ctx: Ctx, call: Call, ops: RawOps)
 {
     if !verify_time(
         start_time: order.start_time,
@@ -85,20 +87,21 @@ uses (ctx: Ctx, call: Call, ops: RawOps)
     }
     let numerator = order.numerator
     let denominator = order.denominator
-    if order.order_type == CONTRACT as u256 {
+    let order_type = checked_enum(order.order_type, variants: 5)
+    if order_type == CONTRACT as u256 {
         if numerator * denominator != 1 {
-            revert_error(BadFraction {})
+            revert_with0(error_selector<BadFraction>())
         }
         return (1, 1, 1)
     }
     if numerator > denominator || numerator == 0 {
-        revert_error(BadFraction {})
+        revert_with0(error_selector<BadFraction>())
     }
-    if numerator < denominator && order.order_type & 1 == 0 {
-        revert_error(PartialFillsNotEnabledForOrder {})
+    if numerator < denominator && order_type & 1 == 0 {
+        revert_with0(error_selector<PartialFillsNotEnabledForOrder>())
     }
-    let order_hash = consideration_length_checked_order_hash(book, order)
-    let raw_status = ops.sload(status_slot(order_hash))
+    let order_hash = consideration_length_checked_order_hash(order)
+    let raw_status = raw_status(order_hash)
     let status = unpack_status(raw_status)
     if !verify_order_status(
         order_hash,
@@ -113,7 +116,7 @@ uses (ctx: Ctx, call: Call, ops: RawOps)
             env,
             offerer: order.offerer,
             order_hash,
-            signature: book.bytes(order.signature),
+            signature: order.signature,
         )
     }
     let (fill_numerator, fill_denominator) = adjust_fill_fraction(
@@ -124,264 +127,249 @@ uses (ctx: Ctx, call: Call, ops: RawOps)
     (order_hash, fill_numerator, fill_denominator)
 }
 
-/// `_applyFractions`: current amounts of the partial fill; offer items go to
-/// `recipient`.
+/// `_applyFractions`: current amounts of the partial fill. Consideration
+/// items keep the receiver the model builder copied from their recipient.
+#[arithmetic(unchecked)]
 fn apply_fractions(
-    _ book: Book,
-    order: *OrderState,
+    _ items: mut MemArray<Item>,
+    order: OrderState,
     numerator: u256,
     denominator: u256,
-    recipient: Address,
 )
 uses (ctx: Ctx)
 {
-    let mut any_native = false
-    let mut i: u256 = 0
+    // A whole fill of a fixed amount is that amount (`apply_fraction`'s
+    // first case).
+    let whole = numerator == denominator
+    var any_native = false
+    var i: u256 = 0
     while i < order.offer_len {
-        if apply_offer_fraction(book, order, index: i, numerator, denominator, recipient) {
+        // The order's items lie in the pool.
+        let item = unsafe {
+            mut *element(items.ptr(), order.offer_start + i)
+        }
+        let amount = if whole && item.start_amount == item.end_amount {
+            item.end_amount
+        } else {
+            apply_fraction(
+                start_amount: item.start_amount,
+                end_amount: item.end_amount,
+                numerator,
+                denominator,
+                start_time: order.start_time,
+                end_time: order.end_time,
+                round_up: false,
+            )
+        }
+        item.amount = amount
+        item.original = amount
+        if item.item_type == NATIVE as u256 {
             any_native = true
         }
         i += 1
     }
     if order.order_type < 4 && any_native {
-        revert_error(InvalidNativeOfferItem {})
+        revert_with0(error_selector<InvalidNativeOfferItem>())
     }
     i = 0
     while i < order.consideration_len {
-        apply_consideration_fraction(book, order, index: i, numerator, denominator)
+        let item = unsafe {
+            mut *element(items.ptr(), order.consideration_start + i)
+        }
+        let amount = if whole && item.start_amount == item.end_amount {
+            item.end_amount
+        } else {
+            apply_fraction(
+                start_amount: item.start_amount,
+                end_amount: item.end_amount,
+                numerator,
+                denominator,
+                start_time: order.start_time,
+                end_time: order.end_time,
+                round_up: true,
+            )
+        }
+        item.amount = amount
+        item.original = amount
         i += 1
     }
 }
 
-/// Returns whether the item is a native token item.
-fn apply_offer_fraction(
-    _ book: Book,
-    order: *OrderState,
-    index: u256,
-    numerator: u256,
-    denominator: u256,
-    recipient: Address,
-) -> bool
-uses (ctx: Ctx)
-{
-    let item = book.offer_item(order, index)
-    let amount = apply_fraction(
-        start_amount: item.start_amount,
-        end_amount: item.end_amount,
-        numerator,
-        denominator,
-        start_time: order.start_time,
-        end_time: order.end_time,
-        round_up: false,
-    )
-    item.amount = amount
-    item.original = amount
-    item.receiver = recipient
-    item.item_type == NATIVE as u256
-}
-
-fn apply_consideration_fraction(
-    _ book: Book,
-    order: *OrderState,
-    index: u256,
-    numerator: u256,
-    denominator: u256,
-)
-uses (ctx: Ctx)
-{
-    let item = book.consideration_item(order, index)
-    let amount = apply_fraction(
-        start_amount: item.start_amount,
-        end_amount: item.end_amount,
-        numerator,
-        denominator,
-        start_time: order.start_time,
-        end_time: order.end_time,
-        round_up: true,
-    )
-    item.amount = amount
-    item.original = amount
-    item.receiver = item.recipient
-}
-
-pub fn item_transfer(_ item: *Item) -> Transfer {
-    Transfer {
-        item_type: item.item_type,
-        token: item.token,
-        identifier: item.identifier,
-        amount: item.amount,
-        recipient: item.receiver,
-    }
-}
-
-/// `_transferEach`: offer items from the offerer, consideration items from
-/// the caller, then refund any native tokens left in the contract.
+/// `_transferEach`: offer items from the offerer to `recipient`,
+/// consideration items from the caller, then refund any native tokens left in
+/// the contract. Kept out of line so its frame does not join
+/// `finish_single_order`'s.
+#[arithmetic(unchecked)]
+#[inline(never)]
 fn transfer_each(
     _ env: Env,
-    book: Book,
-    order: *OrderState,
+    items: MemArray<Item>,
+    order: OrderState,
     fulfiller_conduit_key: u256,
     recipient: Address,
 )
 uses (ctx: Ctx, call: mut Call, ops: RawOps)
 {
-    let mut i: u256 = 0
+    // Without a conduit only direct transfers use the buffer, which one
+    // conduit transfer's room covers.
+    var buf = transfer_buffer(
+        if (order.conduit_key | fulfiller_conduit_key) != 0 {
+            order.offer_len + order.consideration_len
+        } else {
+            1
+        },
+    )
+    var acc = new_accumulator()
+    var i: u256 = 0
     while i < order.offer_len {
-        let item = book.offer_item(order, i)
-        item.receiver = recipient
-        i += 1
-    }
-    let buf = transfer_buffer(order.offer_len + order.consideration_len)
-    let mut acc = new_accumulator()
-    i = 0
-    while i < order.offer_len {
-        acc = transfer_offer_item(env, book, order, index: i, recipient, acc, buf)
+        // The order's items lie in the pool.
+        let item = unsafe {
+            ref *element(items.ptr(), order.offer_start + i)
+        }
+        acc = transfer_item(
+            item_type: item.item_type,
+            token: item.token,
+            identifier: item.identifier,
+            amount: item.amount,
+            recipient,
+            from: order.offerer,
+            conduit_key: order.conduit_key,
+            acc,
+            mut buf,
+            env,
+        )
         i += 1
     }
     i = 0
     while i < order.consideration_len {
-        acc = transfer_consideration_item(
-            env,
-            book,
-            order,
-            index: i,
-            fulfiller_conduit_key,
+        let item = unsafe {
+            ref *element(items.ptr(), order.consideration_start + i)
+        }
+        if item.item_type == NATIVE as u256 && item.amount > ctx.selfbalance().as_wei() {
+            revert_with0(error_selector<InsufficientNativeTokensSupplied>())
+        }
+        acc = transfer_item(
+            item_type: item.item_type,
+            token: item.token,
+            identifier: item.identifier,
+            amount: item.amount,
+            recipient: item.receiver,
+            from: ctx.caller(),
+            conduit_key: fulfiller_conduit_key,
             acc,
-            buf,
+            mut buf,
+            env,
         )
         i += 1
     }
-    let _ = trigger_if_armed(acc, buf, env)
-    let balance = ctx.selfbalance()
+    let _ = trigger_if_armed(acc, mut buf, env)
+    let balance = ctx.selfbalance().as_wei()
     if balance != 0 {
         transfer_native_tokens(to: ctx.caller(), amount: balance)
     }
 }
 
-fn transfer_offer_item(
-    _ env: Env,
-    book: Book,
-    order: *OrderState,
-    index: u256,
-    recipient: Address,
-    acc: Accumulator,
-    buf: *u8,
-) -> Accumulator
-uses (ctx: Ctx, call: mut Call, ops: RawOps)
-{
-    let item = book.offer_item(order, index)
-    transfer(
-        item_transfer(item),
-        from: order.offerer,
-        conduit_key: order.conduit_key,
-        acc,
-        buf,
-        env,
-    )
-}
-
-fn transfer_consideration_item(
-    _ env: Env,
-    book: Book,
-    order: *OrderState,
-    index: u256,
-    fulfiller_conduit_key: u256,
-    acc: Accumulator,
-    buf: *u8,
-) -> Accumulator
-uses (ctx: Ctx, call: mut Call, ops: RawOps)
-{
-    let item = book.consideration_item(order, index)
-    if item.item_type == NATIVE as u256 && item.amount > ctx.selfbalance() {
-        revert_error(InsufficientNativeTokensSupplied {})
+/// Write the `count` items from `items` at `dst` as an ABI `SpentItem[]`,
+/// or with `received` as a `ReceivedItem[]`: the words of the typed event
+/// fields, with the item type checked as Solidity's encoder checks it, the
+/// current amount and the receiver. `dst` must have room for the
+/// `32 + count * stride` bytes.
+#[arithmetic(unchecked)]
+#[inline(always)]
+unsafe fn write_fulfilled_items(_ dst: *u8, items: *Item, count: u256, received: bool) {
+    let stride: u256 = if received { 160 } else { 128 }
+    unsafe {
+        store_at(dst, offset: 0, value: count)
     }
-    transfer(
-        item_transfer(item),
-        from: ctx.caller(),
-        conduit_key: fulfiller_conduit_key,
-        acc,
-        buf,
-        env,
-    )
-}
-
-pub fn spent_items(_ book: Book, start: u256, count: u256) -> DynArray<SpentItem> {
-    let mut out = MemVec<SpentItem>::zeroed(count)
-    let mut i: u256 = 0
+    var i: u256 = 0
     while i < count {
-        let item = book.items.at(start + i)
-        out.set(
-            index: i,
-            value: SpentItem {
-                itemType: item.item_type.downcast_truncate(),
-                token: item.token,
-                identifier: item.identifier,
-                amount: item.amount,
-            },
-        )
+        // The caller's items lie in the pool.
+        let item = unsafe {
+            ref *element(items, i)
+        }
+        let out = 32 + i * stride
+        unsafe {
+            store_at(
+                dst,
+                offset: out,
+                value: checked_enum(item.item_type, variants: 6),
+            )
+            store_at(dst, offset: out + 32, value: item.token.word())
+            store_at(dst, offset: out + 64, value: item.identifier)
+            store_at(dst, offset: out + 96, value: item.amount)
+            if received {
+                store_at(dst, offset: out + 128, value: item.receiver.word())
+            }
+        }
         i += 1
     }
-    out.to_dyn_array()
 }
 
-pub fn received_items(_ book: Book, start: u256, count: u256) -> DynArray<ReceivedItem> {
-    let mut out = MemVec<ReceivedItem>::zeroed(count)
-    let mut i: u256 = 0
-    while i < count {
-        let item = book.items.at(start + i)
-        out.set(
-            index: i,
-            value: ReceivedItem {
-                itemType: item.item_type.downcast_truncate(),
-                token: item.token,
-                identifier: item.identifier,
-                amount: item.amount,
-                recipient: item.receiver,
-            },
-        )
-        i += 1
-    }
-    out.to_dyn_array()
-}
-
-pub fn emit_order_fulfilled(_ order_hash: u256, book: Book, order: *OrderState, recipient: Address)
+/// `OrderFulfilled`, encoded directly into the log data.
+#[arithmetic(unchecked)]
+pub fn emit_order_fulfilled(_ order_hash: u256, book: Book, order: OrderState, recipient: Address)
 uses (log: mut Log)
 {
-    log.emit(
-        OrderFulfilled {
-            orderHash: Bytes32 { val: order_hash },
-            offerer: order.offerer,
-            zone: order.zone,
-            recipient,
-            offer: spent_items(book, start: order.offer_start, count: order.offer_len),
-            consideration: received_items(
-                book,
-                start: order.consideration_start,
-                count: order.consideration_len,
-            ),
-        },
+    // Head: orderHash, recipient and the offer and consideration offsets.
+    // Item counts are below 2**32, so no size overflows.
+    let consideration_at = 0xa0 + order.offer_len * 128
+    // Every word of the buffer is written below: the head, then both item
+    // arrays, which exactly fill the rest.
+    var data = unsafe {
+        Buffer::uninit(consideration_at + 32 + order.consideration_len * 160)
+    }
+    unsafe {
+        data.put(offset: 0, value: order_hash)
+        data.put(offset: 32, value: recipient.word())
+        data.put(offset: 64, value: 0x80)
+        data.put(offset: 96, value: consideration_at)
+        write_fulfilled_items(
+            data.at(0x80),
+            items: element(book.items.ptr(), order.offer_start),
+            count: order.offer_len,
+            received: false,
+        )
+        write_fulfilled_items(
+            data.at(consideration_at),
+            items: element(book.items.ptr(), order.consideration_start),
+            count: order.consideration_len,
+            received: true,
+        )
+    }
+    log.log3(
+        data: data.span(),
+        topic0: OrderFulfilled::TOPIC0,
+        topic1: order.offerer.word(),
+        topic2: order.zone.word(),
     )
 }
 
 /// `_validateAndFulfillAdvancedOrder` for the single order of `book`.
 ///
-/// The phases are separate functions; Fe's borrow checker is much cheaper on
-/// them than on one long body (ISSUES.md #9).
+/// Each phase uses scoped accesses to the order and item owners.
 pub fn validate_and_fulfill_advanced_order(
     _ env: Env,
-    book: Book,
+    book: mut Book,
     resolvers: Resolvers,
     fulfiller_conduit_key: u256,
     recipient: Address,
 ) -> bool
-uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+uses (
+    store: mut OrderStore,
+    guard_state: mut u256,
+    transient_guard: mut TSlot<u256>,
+    ctx: Ctx,
+    call: mut Call,
+    ops: mut RawOps,
+    log: mut Log,
+)
 {
-    let order_type = book.order(0).order_type
+    let order_type = checked_enum(unsafe { (*book.orders.ptr()).order_type }, variants: 5)
     set_reentrancy_guard(env, accept_native_tokens: order_type == CONTRACT as u256)
     if order_type != CONTRACT as u256 {
-        fulfill_single_order(env, book, resolvers, fulfiller_conduit_key, recipient)
+        fulfill_single_order(env, mut book, resolvers, fulfiller_conduit_key, recipient)
     } else {
-        fulfill_single_contract_order(env, book, resolvers, fulfiller_conduit_key, recipient)
+        fulfill_single_contract_order(env, mut book, resolvers, fulfiller_conduit_key, recipient)
     }
     clear_reentrancy_guard(env)
     true
@@ -389,64 +377,69 @@ uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
 
 fn fulfill_single_order(
     _ env: Env,
-    book: Book,
+    book: mut Book,
     resolvers: Resolvers,
     fulfiller_conduit_key: u256,
     recipient: Address,
 )
-uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+uses (store: mut OrderStore, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
 {
     let (order_hash, fill_numerator, fill_denominator) = prepare_single_order(
         env,
-        book,
+        mut book,
         resolvers,
-        recipient,
     )
     authorize_single_order(book, order_hash, fill_numerator, fill_denominator)
-    finish_single_order(env, book, order_hash, fulfiller_conduit_key, recipient)
+    finish_single_order(
+        env,
+        mut book,
+        order_hash,
+        fulfiller_conduit_key,
+        recipient,
+    )
 }
 
 fn fulfill_single_contract_order(
     _ env: Env,
-    book: Book,
+    book: mut Book,
     resolvers: Resolvers,
     fulfiller_conduit_key: u256,
     recipient: Address,
 )
-uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
+uses (store: mut OrderStore, ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
 {
-    let _ = prepare_single_order(env, book, resolvers, recipient)
-    let generated = generate_order(book, order_index: 0, revert_on_invalid: true)
+    let _ = prepare_single_order(env, mut book, resolvers)
+    let order_hash = generate_order(book, order_index: 0, revert_on_invalid: true)
+    install_generated_order(mut book, order_index: 0)
     finish_single_order(
         env,
-        book: install_generated_order(book, order_index: 0, generated),
-        order_hash: generated.order_hash,
+        mut book,
+        order_hash,
         fulfiller_conduit_key,
         recipient,
     )
 }
 
 /// Validate the order, resolve criteria and apply the fill fraction.
-fn prepare_single_order(_ env: Env, book: Book, resolvers: Resolvers, recipient: Address) -> (
-    u256,
-    u256,
-    u256,
-)
-uses (ctx: Ctx, call: Call, ops: RawOps)
+#[inline(always)]
+fn prepare_single_order(_ env: Env, book: mut Book, resolvers: Resolvers) -> (u256, u256, u256)
+uses (store: OrderStore, ctx: Ctx, call: Call, ops: RawOps)
 {
     let (order_hash, fill_numerator, fill_denominator) = validate_order(
         env,
-        book,
-        order: book.order(0),
+        order: unsafe {
+            ref *book.orders.ptr()
+        },
         revert_on_invalid: true,
     )
-    apply_criteria_resolvers(book, resolvers)
+    apply_criteria_resolvers(mut book, resolvers)
     apply_fractions(
-        book,
-        order: book.order(0),
+        mut book.items,
+        order: unsafe {
+            ref *book.orders.ptr()
+        },
         numerator: fill_numerator,
         denominator: fill_denominator,
-        recipient,
     )
     (order_hash, fill_numerator, fill_denominator)
 }
@@ -458,17 +451,23 @@ fn authorize_single_order(
     fill_numerator: u256,
     fill_denominator: u256,
 )
-uses (ctx: Ctx, call: mut Call, ops: mut RawOps)
+uses (store: mut OrderStore, ctx: Ctx, call: mut Call, ops: mut RawOps)
 {
-    let order_hashes = Arr<u256>::alloc(1)
-    *order_hashes.at(0) = 0
-    assert_restricted_advanced_order_authorization(
-        book,
-        order: book.order(0),
-        order_hashes,
-        order_hash,
-        order_index: 0,
-    )
+    // Only restricted orders consult their zone.
+    let order = unsafe {
+        ref *book.orders.ptr()
+    }
+    if order.order_type > 1 {
+        let order_hashes = MemArray<u256>::new_zeroed(1)
+        let _ = check_restricted_advanced_order_authorization(
+            book,
+            order,
+            order_hashes: ref order_hashes,
+            order_hash,
+            order_index: 0,
+            revert_on_invalid: true,
+        )
+    }
     let _ = update_status(
         order_hash,
         numerator: fill_numerator,
@@ -480,22 +479,33 @@ uses (ctx: Ctx, call: mut Call, ops: mut RawOps)
 /// Transfers, `validateOrder` or `ratifyOrder`, and `OrderFulfilled`.
 fn finish_single_order(
     _ env: Env,
-    book: Book,
+    book: mut Book,
     order_hash: u256,
     fulfiller_conduit_key: u256,
     recipient: Address,
 )
 uses (ctx: Ctx, call: mut Call, ops: mut RawOps, log: mut Log)
 {
+    let order = unsafe {
+        ref *book.orders.ptr()
+    }
     transfer_each(
         env,
-        book,
-        order: book.order(0),
+        items: book.items,
+        order,
         fulfiller_conduit_key,
         recipient,
     )
-    let order_hashes = Arr<u256>::alloc(1)
-    *order_hashes.at(0) = order_hash
-    assert_restricted_advanced_order_validity(book, order: book.order(0), order_hashes, order_hash)
-    emit_order_fulfilled(order_hash, book, order: book.order(0), recipient)
+    // Only restricted and contract orders call their zone or offerer.
+    if order.order_type > 1 {
+        var order_hashes = MemArray<u256>::new_zeroed(1)
+        order_hashes[(0) as usize] = order_hash
+        assert_restricted_advanced_order_validity(
+            book,
+            order,
+            order_hashes: ref order_hashes,
+            order_hash,
+        )
+    }
+    emit_order_fulfilled(order_hash, book, order, recipient)
 }
